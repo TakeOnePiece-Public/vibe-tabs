@@ -146,13 +146,17 @@ on openProject(rawFolder, requestedName, configuredPanes, requestedLayout, termi
 		do shell script quoted form of tmuxBin & " select-pane -t " & quoted form of firstPaneID
 
 		if (count of codexRenamePositions) > 0 then
-			delay 3
 			repeat with renamePositionRef in codexRenamePositions
 				set codexPaneID to item (contents of renamePositionRef) of paneIDs
-				do shell script quoted form of tmuxBin & " send-keys -t " & quoted form of codexPaneID & " -l " & quoted form of ("/rename " & sessionName)
-				do shell script quoted form of tmuxBin & " send-keys -t " & quoted form of codexPaneID & " C-m"
-				delay 0.5
-				do shell script quoted form of tmuxBin & " send-keys -t " & quoted form of codexPaneID & " C-m"
+				-- Typing before the Codex TUI is ready loses the leading keystrokes
+				-- (only the tail of "/rename <name>" arrives and is sent as a prompt).
+				if my waitForCodexComposer(tmuxBin, codexPaneID) then
+					do shell script quoted form of tmuxBin & " send-keys -t " & quoted form of codexPaneID & " -l " & quoted form of ("/rename " & sessionName)
+					delay 0.3
+					do shell script quoted form of tmuxBin & " send-keys -t " & quoted form of codexPaneID & " C-m"
+				else
+					log "vibe-tab: codex composer never became ready in pane " & codexPaneID & "; skipped /rename " & sessionName
+				end if
 			end repeat
 		end if
 	end if
@@ -254,11 +258,64 @@ on codexCommand(sessionName, homeFolder, dangerousMode, extraArgs, dangerousArgs
 		if codexExtraArgs is not "" then set codexLaunch to codexLaunch & " " & codexExtraArgs
 		return {commandText:(codexLaunch & "; exec /bin/zsh -l"), renameAfterLaunch:true}
 	else
+		-- Syntax is `codex resume [OPTIONS] [SESSION_ID] [PROMPT]`. Configured args
+		-- such as "resume --last" must not be repeated here: a second "resume" would
+		-- be taken as SESSION_ID and the real ID as PROMPT, and clap rejects
+		-- "--last" together with a prompt.
+		set resumeOptions to my codexResumeOptions(codexExtraArgs)
 		set codexLaunch to quoted form of codexBin & " resume"
-		if codexExtraArgs is not "" then set codexLaunch to codexLaunch & " " & codexExtraArgs
+		if resumeOptions is not "" then set codexLaunch to codexLaunch & " " & resumeOptions
 		return {commandText:(codexLaunch & " " & quoted form of codexSessionID & "; exec /bin/zsh -l"), renameAfterLaunch:false}
 	end if
 end codexCommand
+
+-- Drop a leading "resume" subcommand and "--last" from configured codex args so
+-- they can be combined with an explicit session ID.
+on codexResumeOptions(argsText)
+	set AppleScript's text item delimiters to " "
+	set argWords to text items of argsText
+	set AppleScript's text item delimiters to ""
+	set keptWords to {}
+	set seenFirstWord to false
+	repeat with argWordRef in argWords
+		set argWord to contents of argWordRef
+		if argWord is not "" then
+			if (not seenFirstWord) and argWord is "resume" then
+				-- subcommand already supplied by the launcher
+			else if argWord is "--last" then
+				-- meaningless with an explicit session ID
+			else
+				set end of keptWords to argWord
+			end if
+			set seenFirstWord to true
+		end if
+	end repeat
+	set AppleScript's text item delimiters to " "
+	set joinedWords to keptWords as text
+	set AppleScript's text item delimiters to ""
+	return joinedWords
+end codexResumeOptions
+
+-- Poll a tmux pane until the Codex TUI shows its empty-composer placeholder.
+-- Returns false if codex failed to start (CLI usage error on screen) or the
+-- composer never appeared within about 60 seconds (for example an "Update now"
+-- prompt that is still waiting for the user). Note: pane_current_command is
+-- not usable here; tmux reports "zsh" for the wrapper shell even while codex runs.
+on waitForCodexComposer(tmuxBin, paneID)
+	repeat 120 times
+		try
+			set paneText to do shell script quoted form of tmuxBin & " capture-pane -p -t " & quoted form of paneID
+			if paneText contains "Ask Codex to do anything" then
+				delay 0.5
+				return true
+			end if
+			if paneText contains "Usage: codex" then return false
+		on error
+		end try
+		delay 0.5
+	end repeat
+	return false
+end waitForCodexComposer
 
 on parsePaneSpec(paneSpec, homeFolder)
 	if paneSpec starts with "vibe-json:" then
