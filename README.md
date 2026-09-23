@@ -72,7 +72,7 @@ vibe-tabs --app
 
 After opening **Vibe Tabs**, you can keep it in the Dock.
 
-The launcher uses macOS UI scripting only to create native Terminal tabs. The first launch may ask you to allow **Vibe Tabs** under **System Settings → Privacy & Security → Accessibility**.
+The launcher uses macOS UI scripting only to create native Terminal tabs. The first launch may ask you to allow **Vibe Tabs** under **System Settings → Privacy & Security → Accessibility**. Without that permission, each project opens in its own Terminal window instead of a tab, and a note says so.
 
 ## YAML specification
 
@@ -106,7 +106,7 @@ Dangerous mode bypasses approval or sandbox safeguards in the selected coding CL
 Each session requires:
 
 - `name`: stable session name before any suffix.
-- `path`: absolute or `~/` project folder.
+- `path`: absolute or `~/` project folder. A relative path is resolved from the folder that holds the config.
 
 Per-session options override `defaults`. Existing tmux sessions remain untouched, so pane or layout changes take effect after that tmux session is removed.
 
@@ -125,6 +125,37 @@ vibe-tab --layout tiled --profile Ocean web-m1-mbp ~/Code/example-web claude cod
 # Default to Claude + Codex and derive the name from the folder
 vibe-tab ~/Code/example-web
 ```
+
+Check a config without opening anything. This lists every session with its folder, layout, and panes:
+
+```sh
+vibe-tabs --check
+```
+
+`vibe-tabs` exits with `0` when every session opened, `1` when some sessions could not be opened (the rest still open), and `2` when nothing was opened because of a usage, dependency, or config error.
+
+## Troubleshooting
+
+Every error names its cause and, where possible, the fix. The whole config is checked before anything opens, and all problems are listed at once, for example:
+
+```text
+vibe-tabs: error: ~/.vibe-tabs.yml: session "web", pane 2 sets both agent ("claude") and command ("ls"); a pane runs one or the other
+vibe-tabs: error: ~/.vibe-tabs.yml: session #3: path is required
+vibe-tabs: 2 problem(s) in ~/.vibe-tabs.yml; nothing was opened.
+```
+
+| Message | Cause and fix |
+| --- | --- |
+| `yq is not installed` / `jq is not installed` / `tmux is not installed` | Install the missing tool with Homebrew, for example `brew install yq`. |
+| `is not mikefarah/yq version 4` | The Python `yq` is first in `PATH`. Install the Go version with `brew install yq` and put Homebrew's bin folder first. |
+| `is not valid YAML` | The YAML parser message with the line and column follows. Check indentation and quoting there. |
+| `unknown key "..." is ignored` | A warning, usually a typo such as `layuot`. The session still opens. |
+| `skipped, project folder does not exist` | The session's `path` is wrong or the folder moved. Other sessions still open. Relative paths are resolved from the folder that holds the config. |
+| `Required command not found: codex` | An agent CLI in the config is not installed. Install it or remove that pane. |
+| `pane N runs "...", which was not found` | A warning for a `command:` pane whose program is missing. The pane shows the error and drops to a shell. |
+| `[AppleScript error -1743]` | macOS blocked control of Terminal. Allow your terminal app, or Vibe Tabs, under **Privacy & Security → Automation**. |
+| `Unknown Terminal profile "..."` | The `terminal_profile` does not exist. The message lists the available profiles. |
+| `tmux could not create session ...` | tmux's own message follows. The half-created session is removed, so the next run starts clean. |
 
 ## Reuse behavior
 
