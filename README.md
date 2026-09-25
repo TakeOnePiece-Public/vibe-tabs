@@ -64,6 +64,14 @@ Launch everything:
 vibe-tabs
 ```
 
+Launch only some projects by naming them, with or without the suffix:
+
+```sh
+vibe-tabs web
+vibe-tabs web research
+vibe-tabs ~/other-config.yml mobile
+```
+
 Or open the bundled launcher app:
 
 ```sh

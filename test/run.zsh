@@ -32,6 +32,23 @@ if VIBE_TABS_SESSION_COMMAND="$TEST_DIR/capture-args.zsh" \
 fi
 
 rg -q 'Invalid session entry' "$INVALID_OUTPUT"
+
+# Named sessions launch alone, with or without the suffix, in config order.
+: > "$TEST_OUTPUT"
+VIBE_TABS_TEST_OUTPUT="$TEST_OUTPUT" \
+  VIBE_TABS_SESSION_COMMAND="$TEST_DIR/capture-args.zsh" \
+  "$PROJECT_ROOT/bin/vibe-tabs" "$TEST_DIR/fixtures/config.yml" beta-test-mac alpha
+[[ "$(wc -l < "$TEST_OUTPUT" | tr -d ' ')" == "2" ]]
+[[ "$(sed -n '1p' "$TEST_OUTPUT")" == *\|--new-window\|alpha-test-mac\|* ]]
+[[ "$(sed -n '2p' "$TEST_OUTPUT")" == *\|beta-test-mac\|* ]]
+
+if VIBE_TABS_SESSION_COMMAND="$TEST_DIR/capture-args.zsh" \
+  VIBE_TABS_TEST_OUTPUT="$TEST_OUTPUT" \
+  "$PROJECT_ROOT/bin/vibe-tabs" "$TEST_DIR/fixtures/config.yml" gamma >"$INVALID_OUTPUT" 2>&1; then
+  print -u2 "Expected an unknown session name to fail"
+  exit 1
+fi
+rg -q 'Unknown session: gamma' "$INVALID_OUTPUT"
 osacompile -o /tmp/VibeTabTest.scpt "$PROJECT_ROOT/libexec/open-vibe-tab.applescript"
 osacompile -o /tmp/VibeTabsAppTest.scpt "$PROJECT_ROOT/libexec/open-vibe-tabs.applescript"
 dangerous_args="$(osascript \
