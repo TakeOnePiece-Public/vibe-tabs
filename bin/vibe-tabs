@@ -1,162 +1,646 @@
 #!/bin/zsh
-set -euo pipefail
+# vibe-tabs: open every session in a YAML config as a named tmux workspace in Terminal.
+#
+# Exit status:
+#   0  every session opened (or, with --check, the config is valid)
+#   1  at least one session could not be opened; the others were still opened
+#   2  nothing was opened: usage error, missing dependency, or invalid config
 
+set -uo pipefail
+
+PROG="vibe-tabs"
 SCRIPT_PATH="${0:A}"
 PROJECT_ROOT="${SCRIPT_PATH:h:h}"
-SESSION_COMMAND="${VIBE_TABS_SESSION_COMMAND:-$PROJECT_ROOT/bin/vibe-tab}"
+DEFAULT_SESSION_COMMAND="$PROJECT_ROOT/bin/vibe-tab"
+SESSION_COMMAND="${VIBE_TABS_SESSION_COMMAND:-$DEFAULT_SESSION_COMMAND}"
+ISSUES_URL="https://github.com/TakeOnePiece/vibe-tabs/issues"
 ADD_COMMAND="${VIBE_TABS_ADD_COMMAND:-$PROJECT_ROOT/bin/vibe-tabs-add}"
+
+# Started from the macOS app or launchd, PATH is minimal and misses Homebrew.
+for extra_dir in /opt/homebrew/bin /usr/local/bin; do
+  if [[ -d "$extra_dir" && ":$PATH:" != *":$extra_dir:"* ]]; then
+    PATH="$PATH:$extra_dir"
+  fi
+done
+export PATH
 
 if [[ "${1-}" == "add" ]]; then
   shift
   exec "$ADD_COMMAND" "$@"
 fi
 
-if [[ "${1-}" == "--app" || "${1-}" == "app" ]]; then
-  if [[ -d "$PROJECT_ROOT/Vibe Tabs.app" ]]; then
-    exec /usr/bin/open "$PROJECT_ROOT/Vibe Tabs.app"
-  fi
-  if [[ -d "$HOME/Applications/Vibe Tabs.app" ]]; then
-    exec /usr/bin/open "$HOME/Applications/Vibe Tabs.app"
-  fi
-  print -u2 "Vibe Tabs.app was not found. Run ./install.sh from the source checkout."
-  exit 1
-fi
+# ---------------------------------------------------------------------------
+# Reporting helpers
+# ---------------------------------------------------------------------------
 
-if [[ "${1-}" == -* ]]; then
-  print -u2 "Usage: vibe-tabs [config.yml] [session ...]"
-  print -u2 "       vibe-tabs add [options] [folder ...]"
-  exit 1
-fi
+err()  { print -ru2 -- "$PROG: error: $*"; }
+warn() { print -ru2 -- "$PROG: warning: $*"; }
+hint() { print -ru2 -- "  hint: $*"; }
 
-config_file=""
-if [[ "${1-}" == *.yml || "${1-}" == *.yaml || "${1-}" == */* ]]; then
-  config_file="$1"
-  shift
-fi
-requested_names=("$@")
-
-if [[ -z "$config_file" ]]; then
-  if [[ -f "$HOME/.vibe-tabs.yml" ]]; then
-    config_file="$HOME/.vibe-tabs.yml"
-  elif [[ -f "$HOME/.vibe-tabs.yaml" ]]; then
-    config_file="$HOME/.vibe-tabs.yaml"
-  fi
-fi
-config_file="${config_file/#\~/$HOME}"
-
-if [[ ! -f "$config_file" ]]; then
-  print -u2 "No config found. Create ~/.vibe-tabs.yml."
-  exit 1
-fi
-
-yq_bin="$(command -v yq 2>/dev/null || true)"
-jq_bin="$(command -v jq 2>/dev/null || true)"
-[[ -n "$yq_bin" ]] || { print -u2 "Required command not found: yq"; exit 1; }
-[[ -n "$jq_bin" ]] || { print -u2 "Required command not found: jq"; exit 1; }
-
-config_json="$($yq_bin -o=json '.' "$config_file")"
-version="$(print -r -- "$config_json" | $jq_bin -r '.version // 1')"
-[[ "$version" == "1" ]] || { print -u2 "Unsupported config version: $version"; exit 1; }
-print -r -- "$config_json" | $jq_bin -e '.sessions | type == "array"' >/dev/null || {
-  print -u2 "Config must contain a sessions array."
-  exit 1
+# fail EXIT_CODE MESSAGE [HINT ...]
+fail() {
+  local code=$1 message=$2 line
+  shift 2
+  err "$message"
+  for line in "$@"; do hint "$line"; done
+  exit "$code"
 }
 
-requested_json="$($jq_bin -cn '$ARGS.positional' --args -- "${requested_names[@]}")"
-unknown_names="$(print -r -- "$config_json" | $jq_bin -r --argjson requested "$requested_json" '
-  (.defaults.session_suffix // "") as $suffix |
-  [.sessions[] | (.name | gsub("^\\s+|\\s+$"; "")) as $name |
-    $name, (if $suffix == "" then empty else "\($name)-\($suffix)" end)] as $known |
-  $requested - $known | join(" ")
-')"
-if [[ -n "$unknown_names" ]]; then
-  print -u2 "Unknown session: $unknown_names"
-  print -u2 "Available: $(print -r -- "$config_json" | $jq_bin -r '[.sessions[].name | gsub("^\\s+|\\s+$"; "")] | join(" ")')"
-  exit 1
+pretty_path() {
+  local target=$1
+  if [[ "$target" == "$HOME" ]]; then
+    print -r -- "~"
+  elif [[ "$target" == "$HOME"/* ]]; then
+    print -r -- "~/${target#$HOME/}"
+  else
+    print -r -- "$target"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: vibe-tabs [options] [config.yml] [session ...]
+       vibe-tabs add [options] [folder ...]
+
+Open every session in the config as a named tmux workspace in Terminal.
+Name one or more sessions, with or without the suffix, to open only those.
+
+Options:
+  --check      Validate the config and list the sessions without opening anything
+  --app        Open the Vibe Tabs macOS app
+  -h, --help   Show this help
+
+Without a config path, ~/.vibe-tabs.yml (or ~/.vibe-tabs.yaml) is used.
+Relative session paths are resolved from the folder that holds the config.
+
+Exit status: 0 success, 1 some sessions failed to open,
+2 nothing was opened (usage, dependency, or config error).
+EOF
+}
+
+usage_error() {
+  err "$1"
+  print -u2 "Run 'vibe-tabs --help' for usage."
+  exit 2
+}
+
+example_config() {
+  local candidate
+  for candidate in "$PROJECT_ROOT/share/vibe-tabs/.vibe-tabs.yml.example" "$PROJECT_ROOT/.vibe-tabs.yml.example"; do
+    if [[ -f "$candidate" ]]; then
+      print -r -- "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+open_app() {
+  local app_path
+  for app_path in "$PROJECT_ROOT/Vibe Tabs.app" "$HOME/Applications/Vibe Tabs.app"; do
+    if [[ -d "$app_path" ]]; then
+      /usr/bin/open "$app_path" || fail 1 "macOS could not open $app_path"
+      exit 0
+    fi
+  done
+  fail 2 "Vibe Tabs.app was not found in $PROJECT_ROOT or ~/Applications" \
+    "Homebrew installs it with: brew reinstall vibe-tabs" \
+    "From a source checkout, run ./install.sh"
+}
+
+# find_tool NAME [OVERRIDE_PATH] -> prints an executable path or returns 1
+find_tool() {
+  local name=$1 override=${2-}
+  if [[ -n "$override" ]]; then
+    [[ -f "$override" && -x "$override" ]] || return 1
+    print -r -- "$override"
+    return 0
+  fi
+  whence -p -- "$name"
+}
+
+# Same rules as slugify() in open-vibe-tab.applescript, so names match tmux.
+slugify() {
+  print -rn -- "$1" | /usr/bin/tr -cs '[:alnum:]_-' '-' | /usr/bin/sed 's/^-*//; s/-*$//'
+}
+
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+
+check_only=false
+config_file=""
+typeset -a requested_names
+
+# A config path ends in .yml/.yaml or contains a slash; anything else is a session name.
+take_positional() {
+  if [[ "$1" == *.yml || "$1" == *.yaml || "$1" == */* ]]; then
+    [[ -z "$config_file" ]] || usage_error "only one config file can be given (got '$config_file' and '$1')"
+    config_file=$1
+  else
+    requested_names+=("$1")
+  fi
+}
+
+if [[ "${1-}" == "app" ]]; then
+  open_app
+fi
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --app) open_app ;;
+    --check) check_only=true ;;
+    --) shift; break ;;
+    -*) usage_error "unknown option: $1" ;;
+    *) take_positional "$1" ;;
+  esac
+  shift
+done
+for arg in "$@"; do
+  take_positional "$arg"
+done
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
+using_default_launcher=false
+[[ "$SESSION_COMMAND" == "$DEFAULT_SESSION_COMMAND" ]] && using_default_launcher=true
+
+if [[ "$using_default_launcher" == true && "$OSTYPE" != darwin* ]]; then
+  fail 2 "vibe-tabs only runs on macOS (it drives Terminal.app); this system is $OSTYPE"
 fi
 
-is_first_session=true
-while IFS= read -r session_json; do
-  print -r -- "$session_json" | $jq_bin -e '
-    (.name | type == "string" and length > 0) and
-    (.path | type == "string" and length > 0) and
-    (.layout | type == "string") and
-    (.terminal_profile | type == "string") and
-    (.panes | type == "array" and length > 0 and all(.[];
-      type == "object" and
-      (.agent | type == "string") and
-      (.command | type == "string") and
-      (((.agent | length) > 0) != ((.command | length) > 0)) and
-      (.title | type == "string") and
-      (.args | type == "string") and
-      (.dangerous | type == "boolean") and
-      (.dangerous_args | type == "string") and
-      ((.dangerous == false) or ((.dangerous_args | length) > 0) or (.agent == "claude") or (.agent == "codex") or (.agent == "gemini"))
-    ))
-  ' >/dev/null || {
-    print -u2 "Invalid session entry: $session_json"
-    exit 1
-  }
+yq_bin="$(find_tool yq "${VIBE_TABS_YQ-}")" || fail 2 \
+  "yq is not installed or not executable${VIBE_TABS_YQ:+ (VIBE_TABS_YQ=$VIBE_TABS_YQ)}; it is needed to read the YAML config" \
+  "Install it with: brew install yq"
+yq_version="$("$yq_bin" --version 2>&1)" || yq_version=""
+if [[ "$yq_version" != *mikefarah* ]] || ! [[ "$yq_version" =~ 'version v?4\.' ]]; then
+  fail 2 "$yq_bin is not mikefarah/yq version 4 (it reports: ${yq_version:-nothing})" \
+    "vibe-tabs needs the Go yq from https://github.com/mikefarah/yq: brew install yq" \
+    "If the Python yq is also installed, put Homebrew's bin folder first in PATH"
+fi
 
-  session_name="$(print -r -- "$session_json" | $jq_bin -r '.name')"
-  session_path="$(print -r -- "$session_json" | $jq_bin -r '.path')"
-  session_suffix="$(print -r -- "$session_json" | $jq_bin -r '.suffix')"
-  session_layout="$(print -r -- "$session_json" | $jq_bin -r '.layout')"
-  terminal_profile="$(print -r -- "$session_json" | $jq_bin -r '.terminal_profile')"
-  pane_commands=("${(@f)$(print -r -- "$session_json" | $jq_bin -r '.panes[] | "vibe-json:" + @base64')}")
+jq_bin="$(find_tool jq "${VIBE_TABS_JQ-}")" || fail 2 \
+  "jq is not installed or not executable${VIBE_TABS_JQ:+ (VIBE_TABS_JQ=$VIBE_TABS_JQ)}; it is needed to process the config" \
+  "Install it with: brew install jq"
+"$jq_bin" --version >/dev/null 2>&1 || fail 2 "$jq_bin is installed but does not run" "Reinstall it with: brew reinstall jq"
 
-  if [[ -n "$session_suffix" && "$session_name" != *-"$session_suffix" ]]; then
-    session_name="$session_name-$session_suffix"
+if [[ "$using_default_launcher" == true ]]; then
+  whence -p tmux >/dev/null || fail 2 "tmux is not installed; every session runs inside tmux" \
+    "Install it with: brew install tmux"
+  [[ -x /usr/bin/osascript ]] || fail 2 "/usr/bin/osascript is missing; vibe-tabs needs it to control Terminal"
+fi
+
+if [[ ! -e "$SESSION_COMMAND" ]]; then
+  fail 2 "the session launcher is missing: $SESSION_COMMAND" \
+    "Reinstall vibe-tabs (brew reinstall vibe-tabs, or ./install.sh from a checkout)"
+elif [[ -d "$SESSION_COMMAND" || ! -x "$SESSION_COMMAND" ]]; then
+  fail 2 "the session launcher is not an executable file: $SESSION_COMMAND" \
+    "Fix it with: chmod +x '$SESSION_COMMAND'"
+fi
+
+# ---------------------------------------------------------------------------
+# Config file
+# ---------------------------------------------------------------------------
+
+if [[ -z "$config_file" ]]; then
+  if [[ -e "$HOME/.vibe-tabs.yml" ]]; then
+    config_file="$HOME/.vibe-tabs.yml"
+    [[ -e "$HOME/.vibe-tabs.yaml" ]] && warn "both ~/.vibe-tabs.yml and ~/.vibe-tabs.yaml exist; using ~/.vibe-tabs.yml"
+  elif [[ -e "$HOME/.vibe-tabs.yaml" ]]; then
+    config_file="$HOME/.vibe-tabs.yaml"
+  else
+    example="$(example_config)" || example=""
+    if [[ -n "$example" ]]; then
+      fail 2 "no config found; looked for ~/.vibe-tabs.yml and ~/.vibe-tabs.yaml" \
+        "Start from the example: cp '$example' ~/.vibe-tabs.yml"
+    else
+      fail 2 "no config found; looked for ~/.vibe-tabs.yml and ~/.vibe-tabs.yaml" \
+        "Create ~/.vibe-tabs.yml; see the YAML section of the README"
+    fi
   fi
+fi
+
+case "$config_file" in
+  "~") config_file="$HOME" ;;
+  "~/"*) config_file="$HOME/${config_file#\~/}" ;;
+esac
+
+if [[ ! -e "$config_file" ]]; then
+  if [[ -L "$config_file" ]]; then
+    fail 2 "config file is a broken symlink: $config_file -> $(readlink "$config_file")"
+  fi
+  fail 2 "config file not found: $config_file"
+fi
+[[ -d "$config_file" ]] && fail 2 "config path is a folder, not a file: $config_file"
+[[ -r "$config_file" ]] || fail 2 "config file is not readable (permission denied): $config_file" \
+  "Fix it with: chmod u+r '$config_file'"
+
+config_file="${config_file:A}"
+config_dir="${config_file:h}"
+config_label="$(pretty_path "$config_file")"
+
+tmp_root="${TMPDIR:-/tmp}"
+tmp_root="${tmp_root%/}"
+work_dir="$(/usr/bin/mktemp -d "$tmp_root/vibe-tabs.XXXXXX" 2>/dev/null)" || \
+  fail 2 "could not create a temporary folder in $tmp_root" "Check free disk space and permissions on that folder"
+trap '/bin/rm -rf "$work_dir"' EXIT
+
+if ! "$yq_bin" ea -o=json -I0 '[.]' "$config_file" >"$work_dir/docs.json" 2>"$work_dir/yq.err"; then
+  err "$config_label is not valid YAML:"
+  /usr/bin/sed -e 's/^Error: //' -e 's/^/  /' "$work_dir/yq.err" >&2
+  hint "Check indentation (spaces, not tabs) and quoting around the line and column above"
+  exit 2
+fi
+
+doc_count="$("$jq_bin" 'length' "$work_dir/docs.json")" || fail 2 "internal error: could not read yq output" "Please report this at $ISSUES_URL"
+if (( doc_count > 1 )); then
+  fail 2 "$config_label contains $doc_count YAML documents (separated by ---); vibe-tabs reads only one" \
+    "Merge them into a single document"
+fi
+if [[ "$doc_count" == 0 ]] || "$jq_bin" -e '.[0] == null' "$work_dir/docs.json" >/dev/null; then
+  example="$(example_config)" || example=""
+  fail 2 "$config_label is empty" ${example:+"Start from the example: cp '$example' '$config_file'"}
+fi
+"$jq_bin" '.[0]' "$work_dir/docs.json" >"$work_dir/config.json"
+
+# ---------------------------------------------------------------------------
+# Structural validation: types, required keys, allowed values.
+# Every problem is reported at once as "level<TAB>message".
+# ---------------------------------------------------------------------------
+
+read -r -d '' VALIDATE_JQ <<'JQ'
+def tname:
+  if type == "object" then "a mapping"
+  elif type == "array" then "a list"
+  elif type == "null" then "empty"
+  else "\(type) \(tojson)" end;
+def problem($msg): {level: "error", msg: $msg};
+def notice($msg): {level: "warning", msg: $msg};
+def layouts: ["auto", "even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"];
+def pane_keys: ["agent", "command", "title", "args", "dangerous", "dangerous_args"];
+
+def unknown_keys($obj; $allowed; $ctx):
+  $obj | keys[] | select(. as $k | $allowed | index($k) | not) |
+  notice("\($ctx): unknown key \(tojson) is ignored (known keys: \($allowed | join(", ")))");
+
+def str_field($obj; $key; $ctx; $required):
+  $obj[$key] as $v |
+  if $v == null then
+    (if $required then problem("\($ctx): \($key) is required") else empty end)
+  elif ($v | type) == "string" then
+    (if $required and ($v | test("^\\s*$")) then problem("\($ctx): \($key) must not be empty") else empty end)
+  elif ($v | type) == "number" or ($v | type) == "boolean" then
+    problem("\($ctx): \($key) must be text, got \($v | tname); wrap it in quotes")
+  else
+    problem("\($ctx): \($key) must be text, got \($v | tname)")
+  end;
+
+def bool_field($obj; $key; $ctx):
+  $obj[$key] as $v |
+  if $v == null or ($v | type) == "boolean" then empty
+  else problem("\($ctx): \($key) must be true or false, got \($v | tojson)") end;
+
+def layout_field($obj; $ctx):
+  str_field($obj; "layout"; $ctx; false),
+  ($obj.layout as $v |
+    if ($v | type) == "string" and ($v | length) > 0 and (layouts | index($v) | not) then
+      problem("\($ctx): layout \($v | tojson) is not supported; use one of: \(layouts | join(", "))")
+    else empty end);
+
+def check_pane($p; $ctx):
+  if ($p | type) == "string" then
+    (if ($p | test("^\\s*$")) then problem("\($ctx) is empty") else empty end)
+  elif ($p | type) == "object" then
+    unknown_keys($p; pane_keys; $ctx),
+    (["agent", "command", "title", "args", "dangerous_args"][] as $k | str_field($p; $k; $ctx; false)),
+    bool_field($p; "dangerous"; $ctx)
+  else
+    problem("\($ctx) must be an agent name, a command, or a mapping; got \($p | tname)")
+  end;
+
+def check_panes($obj; $ctx):
+  $obj.panes as $panes |
+  if $panes == null then empty
+  elif ($panes | type) != "array" then problem("\($ctx): panes must be a list, got \($panes | tname)")
+  elif ($panes | length) == 0 then problem("\($ctx): panes must list at least one pane")
+  else $panes | to_entries[] | check_pane(.value; "\($ctx), pane \(.key + 1)") end;
+
+def check_agents($agents):
+  if $agents == null then empty
+  elif ($agents | type) != "object" then
+    problem("defaults.agents must be a mapping of agent name to settings, got \($agents | tname)")
+  else
+    $agents | to_entries[] | .key as $name | .value as $a | "defaults.agents.\($name)" as $ctx |
+    if $a == null then empty
+    elif ($a | type) != "object" then problem("\($ctx) must be a mapping, got \($a | tname)")
+    else
+      unknown_keys($a; ["title", "args", "dangerous", "dangerous_args"]; $ctx),
+      (["title", "args", "dangerous_args"][] as $k | str_field($a; $k; $ctx; false)),
+      bool_field($a; "dangerous"; $ctx)
+    end
+  end;
+
+if type != "object" then
+  problem("the config must be a mapping with version, defaults, and sessions keys; got \(tname)")
+else
+  unknown_keys(.; ["version", "defaults", "sessions"]; "top level"),
+  (if has("version") and ((.version | tostring) != "1") then
+    problem("unsupported config version \(.version | tojson); this vibe-tabs understands version 1")
+  else empty end),
+  (.defaults as $d |
+    if $d == null then empty
+    elif ($d | type) != "object" then problem("defaults must be a mapping, got \($d | tname)")
+    else
+      unknown_keys($d; ["session_suffix", "layout", "terminal_profile", "agents", "panes", "codex_args"]; "defaults"),
+      (["session_suffix", "terminal_profile", "codex_args"][] as $k | str_field($d; $k; "defaults"; false)),
+      layout_field($d; "defaults"),
+      check_panes($d; "defaults"),
+      check_agents($d.agents)
+    end),
+  (.sessions as $sessions |
+    if $sessions == null then
+      problem("sessions is missing; add a sessions list with at least one entry that has a name and a path")
+    elif ($sessions | type) != "array" then
+      problem("sessions must be a list (each entry starts with \"- name:\"), got \($sessions | tname)")
+    elif ($sessions | length) == 0 then
+      problem("sessions is empty; add at least one entry that has a name and a path")
+    else
+      $sessions | to_entries[] | .key as $i | .value as $s |
+      (if ($s | type) == "object" and ($s.name | type) == "string" and ($s.name | length) > 0
+        then "session \($s.name | tojson)" else "session #\($i + 1)" end) as $ctx |
+      if ($s | type) != "object" then
+        problem("\($ctx) must be a mapping with name and path, got \($s | tname)")
+      else
+        unknown_keys($s; ["name", "path", "session_suffix", "layout", "terminal_profile", "panes", "codex_args"]; $ctx),
+        str_field($s; "name"; $ctx; true),
+        str_field($s; "path"; $ctx; true),
+        (["session_suffix", "terminal_profile", "codex_args"][] as $k | str_field($s; $k; $ctx; false)),
+        layout_field($s; $ctx),
+        check_panes($s; $ctx)
+      end
+    end)
+end
+| "\(.level)\t\(.msg)"
+JQ
+
+# Normalization: merge defaults into each session and every pane.
+read -r -d '' NORMALIZE_JQ <<'JQ'
+(.defaults // {}) as $defaults |
+($defaults.agents // {}) as $defaultAgents |
+.sessions | to_entries[] | .key as $index | .value |
+(.codex_args // $defaults.codex_args // "") as $legacyCodexArgs |
+(.panes // $defaults.panes // ["claude", "codex"]) as $rawPanes |
+{
+  index: ($index + 1),
+  name: .name,
+  path: .path,
+  suffix: (.session_suffix // $defaults.session_suffix // ""),
+  layout: (.layout // $defaults.layout // "auto"),
+  terminal_profile: (.terminal_profile // $defaults.terminal_profile // ""),
+  panes: [
+    $rawPanes[] |
+    if type == "string" then
+      if test("^[[:alnum:]_.-]+$") then {agent: .} else {command: .} end
+    else . end |
+    . as $pane |
+    if (($pane.agent // "") | length) > 0 then
+      (($defaultAgents[$pane.agent] // {}) + $pane)
+    else
+      $pane
+    end |
+    . as $merged |
+    {
+      agent: ($merged.agent // ""),
+      command: ($merged.command // ""),
+      title: ($merged.title // ""),
+      args: ($merged.args // (if $merged.agent == "codex" then $legacyCodexArgs else "" end)),
+      dangerous: ($merged.dangerous // false),
+      dangerous_args: ($merged.dangerous_args // "")
+    }
+  ]
+}
+JQ
+
+# Semantic validation of the merged panes.
+read -r -d '' PANE_RULES_JQ <<'JQ'
+"session \(.name | tojson)" as $ctx |
+.panes | to_entries[] | "\($ctx), pane \(.key + 1)" as $pctx | .value |
+if (.agent | length) > 0 and (.command | length) > 0 then
+  "\($pctx) sets both agent (\(.agent | tojson)) and command (\(.command | tojson)); a pane runs one or the other"
+elif (.agent | length) == 0 and (.command | length) == 0 then
+  "\($pctx) needs an agent or a command"
+elif .dangerous and (.dangerous_args | length) == 0 and (.agent as $agent | ["claude", "codex", "gemini"] | index($agent) | not) then
+  if (.agent | length) > 0 then
+    "\($pctx) sets dangerous: true for agent \(.agent | tojson), which has no built-in dangerous flag; set dangerous_args"
+  else
+    "\($pctx) sets dangerous: true on a command pane; set dangerous_args to the flags to add"
+  end
+else empty end
+JQ
+
+config_errors=0
+report_issues() {
+  local level message
+  while IFS=$'\t' read -r level message; do
+    [[ -n "$level" ]] || continue
+    if [[ "$level" == "error" ]]; then
+      (( config_errors += 1 ))
+      err "$config_label: $message"
+    else
+      warn "$config_label: $message"
+    fi
+  done
+}
+
+if ! "$jq_bin" -r "$VALIDATE_JQ" "$work_dir/config.json" >"$work_dir/issues.tsv" 2>"$work_dir/jq.err"; then
+  fail 2 "internal error while validating $config_label: $(<"$work_dir/jq.err")" "Please report this at $ISSUES_URL"
+fi
+report_issues <"$work_dir/issues.tsv"
+if (( config_errors > 0 )); then
+  print -u2 "$PROG: $config_errors problem(s) in $config_label; nothing was opened."
+  exit 2
+fi
+
+if ! "$jq_bin" -c "$NORMALIZE_JQ" "$work_dir/config.json" >"$work_dir/sessions.jsonl" 2>"$work_dir/jq.err"; then
+  fail 2 "internal error while reading sessions from $config_label: $(<"$work_dir/jq.err")" "Please report this at $ISSUES_URL"
+fi
+if ! "$jq_bin" -r "$PANE_RULES_JQ" "$work_dir/sessions.jsonl" >"$work_dir/pane-issues.txt" 2>"$work_dir/jq.err"; then
+  fail 2 "internal error while checking panes in $config_label: $(<"$work_dir/jq.err")" "Please report this at $ISSUES_URL"
+fi
+while IFS= read -r message; do
+  [[ -n "$message" ]] || continue
+  (( config_errors += 1 ))
+  err "$config_label: $message"
+done <"$work_dir/pane-issues.txt"
+
+# ---------------------------------------------------------------------------
+# Per-session checks: final tmux names and project folders.
+# ---------------------------------------------------------------------------
+
+typeset -a s_json s_name s_short s_path s_skip
+typeset -A seen_names
+session_json=""
+while IFS= read -r session_json; do
+  [[ -n "$session_json" ]] || continue
+  raw_name="$("$jq_bin" -r '.name' <<<"$session_json")"
+  suffix="$("$jq_bin" -r '.suffix' <<<"$session_json")"
+  raw_path="$("$jq_bin" -r '.path' <<<"$session_json")"
+
+  full_name="$raw_name"
+  if [[ -n "$suffix" && "$full_name" != *-"$suffix" ]]; then
+    full_name="$full_name-$suffix"
+  fi
+  slug="$(slugify "$full_name")"
+  if [[ -z "$slug" ]]; then
+    (( config_errors += 1 ))
+    err "$config_label: session ${(qqq)raw_name}: name must contain at least one letter or number"
+  elif [[ -n "${seen_names[$slug]-}" ]]; then
+    (( config_errors += 1 ))
+    err "$config_label: sessions ${(qqq)seen_names[$slug]} and ${(qqq)raw_name} both become tmux session '$slug'; give them different names"
+  else
+    seen_names[$slug]="$raw_name"
+  fi
+
+  skip_reason=""
+  case "$raw_path" in
+    "~") project_path="$HOME" ;;
+    "~/"*) project_path="$HOME/${raw_path#\~/}" ;;
+    "~"*) project_path=""; skip_reason="path ${(qqq)raw_path} uses ~user, which is not supported; use ~/ or an absolute path" ;;
+    /*) project_path="$raw_path" ;;
+    *) project_path="$config_dir/$raw_path" ;;
+  esac
+  if [[ -z "$skip_reason" ]]; then
+    shown_path="$(pretty_path "$project_path")"
+    if [[ ! -e "$project_path" ]]; then
+      if [[ -L "$project_path" ]]; then
+        skip_reason="project folder is a broken symlink: $shown_path"
+      else
+        skip_reason="project folder does not exist: $shown_path"
+      fi
+    elif [[ ! -d "$project_path" ]]; then
+      skip_reason="project path is a file, not a folder: $shown_path"
+    elif [[ ! -x "$project_path" || ! -r "$project_path" ]]; then
+      skip_reason="project folder is not accessible (permission denied): $shown_path"
+    fi
+  fi
+
+  s_json+=("$session_json")
+  s_name+=("$slug")
+  s_short+=("$(slugify "$raw_name")")
+  s_path+=("$project_path")
+  s_skip+=("$skip_reason")
+done <"$work_dir/sessions.jsonl"
+
+if (( config_errors > 0 )); then
+  print -u2 "$PROG: $config_errors problem(s) in $config_label; nothing was opened."
+  exit 2
+fi
+
+if (( ${#requested_names} > 0 )); then
+  typeset -a keep unknown
+  for requested in "${requested_names[@]}"; do
+    requested_slug="$(slugify "$requested")"
+    matched=false
+    for (( i = 1; i <= ${#s_json}; i++ )); do
+      if [[ "$requested_slug" == "${s_name[i]}" || "$requested_slug" == "${s_short[i]}" ]]; then
+        keep[i]=1
+        matched=true
+      fi
+    done
+    [[ "$matched" == true ]] || unknown+=("$requested")
+  done
+  if (( ${#unknown} > 0 )); then
+    fail 2 "unknown session: ${(j:, :)unknown}" "sessions in $config_label: ${(j: :)s_short}"
+  fi
+  typeset -a f_json f_name f_short f_path f_skip
+  for (( i = 1; i <= ${#s_json}; i++ )); do
+    [[ -n "${keep[i]-}" ]] || continue
+    f_json+=("${s_json[i]}"); f_name+=("${s_name[i]}"); f_short+=("${s_short[i]}")
+    f_path+=("${s_path[i]}"); f_skip+=("${s_skip[i]}")
+  done
+  s_json=("${f_json[@]}"); s_name=("${f_name[@]}"); s_short=("${f_short[@]}")
+  s_path=("${f_path[@]}"); s_skip=("${f_skip[@]}")
+fi
+
+total=${#s_json}
+
+# ---------------------------------------------------------------------------
+# --check: report and stop.
+# ---------------------------------------------------------------------------
+
+if [[ "$check_only" == true ]]; then
+  print -r -- "$config_label is valid: $total session(s)"
+  problems=0
+  for (( i = 1; i <= total; i++ )); do
+    panes_text="$("$jq_bin" -r '[.panes[] | ((if .agent != "" then .agent else .command end) + (if .args != "" then " " + .args else "" end) + (if .dangerous then " [dangerous]" else "" end) + (if .title != "" then " (" + .title + ")" else "" end))] | join(" | ")' <<<"${s_json[i]}")"
+    layout="$("$jq_bin" -r '.layout' <<<"${s_json[i]}")"
+    print -r -- "  ${s_name[i]}  $(pretty_path "${s_path[i]:-?}")  layout=$layout"
+    print -r -- "      panes: $panes_text"
+    if [[ -n "${s_skip[i]}" ]]; then
+      (( problems += 1 ))
+      err "${s_name[i]}: ${s_skip[i]}"
+    fi
+  done
+  if (( problems > 0 )); then
+    print -u2 "$PROG: $problems session(s) would be skipped."
+    exit 1
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Launch
+# ---------------------------------------------------------------------------
+
+typeset -a opened failed
+on_interrupt() {
+  print -u2 ""
+  print -u2 "$PROG: interrupted after opening ${#opened} of $total session(s)"
+  exit 130
+}
+trap on_interrupt INT TERM
+
+is_first_session=true
+for (( i = 1; i <= total; i++ )); do
+  session_name="${s_name[i]}"
+  print -r -- "[$i/$total] $session_name  $(pretty_path "${s_path[i]:-?}")"
+
+  if [[ -n "${s_skip[i]}" ]]; then
+    err "$session_name: skipped, ${s_skip[i]}"
+    failed+=("$session_name: ${s_skip[i]}")
+    continue
+  fi
+
+  session_json="${s_json[i]}"
+  session_layout="$("$jq_bin" -r '.layout' <<<"$session_json")"
+  terminal_profile="$("$jq_bin" -r '.terminal_profile' <<<"$session_json")"
+  pane_commands=("${(@f)$("$jq_bin" -r '.panes[] | "vibe-json:" + @base64' <<<"$session_json")}")
 
   launcher_args=(--layout "$session_layout")
-  if [[ -n "$terminal_profile" ]]; then
-    launcher_args+=(--profile "$terminal_profile")
-  fi
-  if [[ "$is_first_session" == true ]]; then
-    launcher_args+=(--new-window)
+  [[ -n "$terminal_profile" ]] && launcher_args+=(--profile "$terminal_profile")
+  [[ "$is_first_session" == true ]] && launcher_args+=(--new-window)
+
+  "$SESSION_COMMAND" "${launcher_args[@]}" "$session_name" "${s_path[i]}" "${pane_commands[@]}"
+  launch_status=$?
+  if (( launch_status == 0 )); then
+    opened+=("$session_name")
     is_first_session=false
+  elif (( launch_status >= 128 )); then
+    on_interrupt
+  else
+    err "$session_name: could not be opened (launcher exited with status $launch_status; details above)"
+    failed+=("$session_name: launcher failed with status $launch_status")
   fi
-  "$SESSION_COMMAND" "${launcher_args[@]}" "$session_name" "$session_path" "${pane_commands[@]}"
-done < <(print -r -- "$config_json" | $jq_bin -c --argjson requested "$requested_json" '
-  (.defaults // {}) as $defaults |
-  ($defaults.agents // {}) as $defaultAgents |
-  .sessions[] |
-  .name |= (if type == "string" then gsub("^\\s+|\\s+$"; "") else . end) |
-  (.session_suffix // $defaults.session_suffix // "") as $suffix |
-  select(($requested | length) == 0 or
-    (.name as $name | $requested | index($name)) != null or
-    (("\(.name)-\($suffix)") as $full | $requested | index($full)) != null) |
-  (.codex_args // $defaults.codex_args // "") as $legacyCodexArgs |
-  (.panes // $defaults.panes // ["claude", "codex"]) as $rawPanes |
-  {
-    name: .name,
-    path: .path,
-    suffix: (.session_suffix // $defaults.session_suffix // ""),
-    layout: (.layout // $defaults.layout // "auto"),
-    terminal_profile: (.terminal_profile // $defaults.terminal_profile // ""),
-    panes: [
-      $rawPanes[] |
-      if type == "string" then
-        if test("^[[:alnum:]_.-]+$") then {agent: .} else {command: .} end
-      elif type == "object" then .
-      else error("panes must contain strings or objects")
-      end |
-      . as $pane |
-      if (($pane.agent // "") | length) > 0 then
-        (($defaultAgents[$pane.agent] // {}) + $pane)
-      else
-        $pane
-      end |
-      . as $merged |
-      {
-        agent: ($merged.agent // ""),
-        command: ($merged.command // ""),
-        title: ($merged.title // ""),
-        args: ($merged.args // (if $merged.agent == "codex" then $legacyCodexArgs else "" end)),
-        dangerous: ($merged.dangerous // false),
-        dangerous_args: ($merged.dangerous_args // "")
-      }
-    ]
-  }
-')
+done
+
+if (( ${#failed} > 0 )); then
+  print -u2 ""
+  print -u2 "$PROG: opened ${#opened} of $total session(s); ${#failed} failed:"
+  for line in "${failed[@]}"; do
+    print -ru2 -- "  - $line"
+  done
+  exit 1
+fi
+print -r -- "$PROG: opened $total session(s)"

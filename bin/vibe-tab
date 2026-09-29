@@ -1,6 +1,107 @@
 #!/bin/zsh
-set -e
+# vibe-tab: open one project as a named tmux session in a Terminal tab.
+# This wrapper runs open-vibe-tab.applescript and turns raw AppleScript
+# errors such as "execution error: ... (-1743)" into the cause and the fix.
 
+set -uo pipefail
+
+PROG="vibe-tab"
 SCRIPT_PATH="${0:A}"
 PROJECT_ROOT="${SCRIPT_PATH:h:h}"
-exec /usr/bin/osascript "$PROJECT_ROOT/libexec/open-vibe-tab.applescript" "$@"
+APPLESCRIPT="$PROJECT_ROOT/libexec/open-vibe-tab.applescript"
+OSASCRIPT="${VIBE_TAB_OSASCRIPT:-/usr/bin/osascript}"
+
+usage() {
+  cat <<'EOF'
+Usage: vibe-tab [--layout layout] [--profile name] [--new-window] [session-name] /path/to/project [command ...]
+
+Open one project as a named tmux session in a Terminal tab.
+Panes default to "claude" and "codex". Layouts: auto, even-horizontal,
+even-vertical, main-horizontal, main-vertical, tiled.
+EOF
+}
+
+hint() { print -ru2 -- "  hint: $*"; }
+
+if (( $# == 0 )); then
+  usage >&2
+  exit 1
+fi
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ "$OSTYPE" != darwin* ]]; then
+  print -u2 "$PROG: error: vibe-tab only runs on macOS (it drives Terminal.app); this system is $OSTYPE"
+  exit 1
+fi
+if [[ ! -r "$APPLESCRIPT" ]]; then
+  print -u2 "$PROG: error: the AppleScript is missing or unreadable: $APPLESCRIPT"
+  hint "Reinstall vibe-tabs (brew reinstall vibe-tabs, or ./install.sh from a checkout)"
+  exit 1
+fi
+if [[ ! -x "$OSASCRIPT" ]]; then
+  print -u2 "$PROG: error: $OSASCRIPT is missing; vibe-tab needs it to control Terminal"
+  exit 1
+fi
+
+# Explain well-known AppleScript error numbers.
+explain_error_number() {
+  local terminal_app="${TERM_PROGRAM:-your terminal app}"
+  [[ "$terminal_app" == "Apple_Terminal" ]] && terminal_app="Terminal"
+  case "$1" in
+    -1743)
+      hint "macOS blocked $terminal_app from controlling Terminal (Automation permission)."
+      hint "Allow it in System Settings > Privacy & Security > Automation, then run vibe-tabs again."
+      hint "If it is not listed, reset the prompt with: tccutil reset AppleEvents"
+      ;;
+    1002|-1719|-25211)
+      hint "macOS blocked keystrokes (Accessibility permission)."
+      hint "Allow $terminal_app or Vibe Tabs in System Settings > Privacy & Security > Accessibility."
+      ;;
+    -600|-609)
+      hint "Terminal quit or crashed while the tab was being opened; run vibe-tabs again."
+      ;;
+    -1712)
+      hint "Terminal did not answer in time; it may be showing a dialog. Check Terminal and try again."
+      ;;
+    -128)
+      hint "The operation was cancelled."
+      ;;
+    -10810|-10814)
+      hint "macOS could not launch Terminal; check that /System/Applications/Utilities/Terminal.app exists."
+      ;;
+  esac
+}
+
+# Rewrite osascript's stderr line by line. Lines from AppleScript "log" pass through.
+translate_stderr() {
+  local line message number
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == *": execution error: "* ]]; then
+      message="${line#*: execution error: }"
+      number=""
+      if [[ "$message" =~ ' \((-?[0-9]+)\)$' ]]; then
+        number="${match[1]}"
+        message="${message% \(*\)}"
+        # -2700 is a plain `error "text"` from the script: the text says it all.
+        [[ "$number" == "-2700" ]] && number=""
+      fi
+      print -ru2 -- "$PROG: error: $message${number:+ [AppleScript error $number]}"
+      [[ -n "$number" ]] && explain_error_number "$number"
+    elif [[ "$line" == *": syntax error: "* ]]; then
+      print -ru2 -- "$PROG: error: the bundled AppleScript failed to compile: ${line#*: syntax error: }"
+      hint "The install is damaged or was edited; reinstall vibe-tabs (brew reinstall vibe-tabs)."
+    else
+      print -ru2 -- "$line"
+    fi
+  done
+}
+
+# stdout goes straight through (fd 3); stderr is translated.
+{
+  "$OSASCRIPT" "$APPLESCRIPT" "$@" 2>&1 1>&3 3>&- | translate_stderr
+  osascript_status=${pipestatus[1]}
+} 3>&1
+exit "$osascript_status"

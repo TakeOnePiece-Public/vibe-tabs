@@ -13,7 +13,12 @@ end run
 
 on launchProjects(configPath)
 	set homeFolder to my homeDirectory()
-	set launcherBin to my resolveExecutable("vibe-tabs", {homeFolder & "/bin/vibe-tabs", "/opt/homebrew/bin/vibe-tabs", "/usr/local/bin/vibe-tabs"})
+	try
+		set launcherBin to my resolveExecutable("vibe-tabs", {homeFolder & "/bin/vibe-tabs", "/opt/homebrew/bin/vibe-tabs", "/usr/local/bin/vibe-tabs"})
+	on error errorMessage
+		display dialog "Vibe Tabs could not find its vibe-tabs command." & return & return & errorMessage & return & return & "Reinstall with: brew reinstall vibe-tabs" buttons {"OK"} default button "OK" with icon stop with title "Vibe Tabs"
+		return
+	end try
 	set launchCommand to quoted form of launcherBin
 	if configPath is not "" then
 		set launchCommand to launchCommand & " " & quoted form of configPath
@@ -21,11 +26,15 @@ on launchProjects(configPath)
 	try
 		do shell script launchCommand
 	on error errorMessage number errorNumber
-		if errorMessage contains "Accessibility" then
-			set dialogResult to display dialog "Vibe Tabs needs Accessibility access to create native Terminal tabs." & return & return & "Enable Vibe Tabs in System Settings, then click the Dock icon again." buttons {"Cancel", "Open Settings"} default button "Open Settings" with icon caution
+		if errorMessage contains "AppleScript error -1743" or errorMessage contains "Not authorized to send Apple events" then
+			set dialogResult to display dialog "Vibe Tabs needs permission to control Terminal." & return & return & "Allow Vibe Tabs to control Terminal in System Settings > Privacy & Security > Automation, then click the Dock icon again." buttons {"Cancel", "Open Settings"} default button "Open Settings" with icon caution with title "Vibe Tabs"
+			if button returned of dialogResult is "Open Settings" then do shell script "/usr/bin/open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Automation'"
+		else if errorMessage contains "AppleScript error 1002" or errorMessage contains "not allowed to send keystrokes" then
+			set dialogResult to display dialog "Vibe Tabs needs Accessibility access to create native Terminal tabs." & return & return & "Enable Vibe Tabs in System Settings, then click the Dock icon again." buttons {"Cancel", "Open Settings"} default button "Open Settings" with icon caution with title "Vibe Tabs"
 			if button returned of dialogResult is "Open Settings" then do shell script "/usr/bin/open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'"
 		else
-			display dialog "Vibe Tabs could not open your projects." & return & return & errorMessage buttons {"OK"} default button "OK" with icon stop
+			if errorMessage is "The command exited with a non-zero status." then set errorMessage to "vibe-tabs exited with status " & errorNumber & " without an error message."
+			display dialog "Vibe Tabs could not open all of your projects." & return & return & errorMessage buttons {"OK"} default button "OK" with icon stop with title "Vibe Tabs"
 		end if
 	end try
 end launchProjects
@@ -60,9 +69,11 @@ end open
 
 on resolveExecutable(commandName, fallbackPaths)
 	try
-		set resolvedPath to do shell script "/bin/zsh -lc " & quoted form of ("command -v " & commandName & " 2>/dev/null")
-		if resolvedPath is not "" then return resolvedPath
-	on error
+		set lookupOutput to do shell script "/bin/zsh -lc " & quoted form of ("command -v " & quoted form of commandName) & " 2>/dev/null"
+		if lookupOutput is not "" then
+			set resolvedPath to last paragraph of lookupOutput
+			if resolvedPath starts with "/" then return resolvedPath
+		end if
 	end try
 
 	repeat with fallbackPath in fallbackPaths
@@ -72,7 +83,10 @@ on resolveExecutable(commandName, fallbackPaths)
 		on error
 		end try
 	end repeat
-	error "Required command not found: " & commandName
+	set AppleScript's text item delimiters to ", "
+	set searchedText to fallbackPaths as text
+	set AppleScript's text item delimiters to ""
+	error "Required command not found: " & commandName & ". Looked in your login shell PATH and in " & searchedText & "."
 end resolveExecutable
 
 on homeDirectory()
