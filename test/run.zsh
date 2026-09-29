@@ -282,6 +282,14 @@ OUT="$(applescript_call 'effectiveAgentArgs("codex", true, "--model gpt", "")')"
 check "dangerous args appended" '[[ "$OUT" == "--model gpt --yolo" ]]'
 OUT="$(applescript_call 'codexResumeOptions("resume --last --yolo")')"
 check "codex resume options drop resume and --last" '[[ "$OUT" == "--yolo" ]]'
+mkdir -p "$WORK/codex-home/.codex/sessions/2026/09/10" "$WORK/codex-home/.codex/archived_sessions"
+: >"$WORK/codex-home/.codex/sessions/2026/09/10/rollout-2026-09-10T08-49-17-kept-thread.jsonl"
+OUT="$(applescript_call "codexRolloutExists(\"$WORK/codex-home\", \"kept-thread\")")"
+check "codex thread with a rollout is resumable" '[[ "$OUT" == "true" ]]'
+OUT="$(applescript_call "codexRolloutExists(\"$WORK/codex-home\", \"pruned-thread\")")"
+check "codex thread without a rollout starts fresh" '[[ "$OUT" == "false" ]]'
+OUT="$(applescript_call "codexRolloutExists(\"$WORK/codex-home\", \"\")")"
+check "empty codex thread id is not resumable" '[[ "$OUT" == "false" ]]'
 OUT="$(applescript_call 'absoluteProjectPath("~/code", "/Users/me")')"
 check "~/ expands" '[[ "$OUT" == "/Users/me/code" ]]'
 OUT="$(applescript_call 'findExecutable("definitely-not-a-command-xyz", {"/nonexistent/x"})')"

@@ -328,6 +328,7 @@ on codexCommand(sessionName, homeFolder, dangerousMode, extraArgs, dangerousArgs
 		on error
 			set codexSessionID to ""
 		end try
+		if not my codexRolloutExists(homeFolder, codexSessionID) then set codexSessionID to ""
 	end if
 
 	if codexSessionID is "" then
@@ -343,6 +344,7 @@ on codexCommand(sessionName, homeFolder, dangerousMode, extraArgs, dangerousArgs
 			on error
 				set codexSessionID to ""
 			end try
+			if not my codexRolloutExists(homeFolder, codexSessionID) then set codexSessionID to ""
 		end if
 	end if
 
@@ -363,6 +365,20 @@ on codexCommand(sessionName, homeFolder, dangerousMode, extraArgs, dangerousArgs
 		return {commandText:(codexLaunch & " " & quoted form of codexSessionID & "; exec /bin/zsh -l"), renameAfterLaunch:false}
 	end if
 end codexCommand
+
+-- The name index outlives the conversations it points at: once Codex prunes or
+-- someone deletes a rollout file, `codex resume <id>` fails with "no rollout
+-- found". Only resume a thread whose rollout is still on disk.
+on codexRolloutExists(homeFolder, codexSessionID)
+	if codexSessionID is "" then return false
+	set codexHome to homeFolder & "/.codex"
+	try
+		set rolloutPath to do shell script "/usr/bin/find " & quoted form of (codexHome & "/sessions") & " " & quoted form of (codexHome & "/archived_sessions") & " -name " & quoted form of ("rollout-*" & codexSessionID & ".jsonl") & " -print -quit 2>/dev/null; true"
+	on error
+		return false
+	end try
+	return rolloutPath is not ""
+end codexRolloutExists
 
 -- Drop a leading "resume" subcommand and "--last" from configured codex args so
 -- they can be combined with an explicit session ID.
