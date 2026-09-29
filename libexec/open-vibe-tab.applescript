@@ -207,26 +207,20 @@ on openProject(rawFolder, requestedName, configuredPanes, requestedLayout, termi
 			my applyTerminalProfile(launchedTab, terminalProfile)
 		else
 			set targetWindow to front window
+			set targetWindowID to id of targetWindow
 			set previousWindowIDs to id of every window
 			set previousTabCount to count of tabs of targetWindow
-			tell application "System Events"
-				tell process "Terminal"
-					set frontmost to true
-					key code 17 using command down
-				end tell
-			end tell
-			delay 0.4
 
-			set launchedTab to missing value
-			repeat with candidateWindow in windows
-				if (id of candidateWindow) is not in previousWindowIDs and (count of tabs of candidateWindow) > 0 then
-					set launchedTab to selected tab of candidateWindow
-					exit repeat
-				end if
-			end repeat
-			if launchedTab is missing value and (count of tabs of targetWindow) > previousTabCount then set launchedTab to selected tab of targetWindow
-			if launchedTab is missing value then error "Terminal did not create a new tab. Allow Vibe Tabs to control Terminal in System Settings > Privacy & Security > Accessibility."
-			do script attachCommand in launchedTab
+			set launchedTab to my openTerminalTab(targetWindowID, previousWindowIDs, previousTabCount)
+			if launchedTab is missing value then
+				-- Terminal swallowed the New Tab keystroke, or nothing is allowed to
+				-- send it. Either way the session still deserves to open, so fall back
+				-- to a window Terminal makes for us directly.
+				log "vibe-tab: Terminal did not open a tab for " & sessionName & ", so it opened a window instead. If this keeps happening, allow the app that runs vibe-tab (Terminal, or Vibe Tabs.app) to control your computer in System Settings > Privacy & Security > Accessibility."
+				set launchedTab to do script attachCommand
+			else
+				do script attachCommand in launchedTab
+			end if
 			my waitForTmuxClient(tmuxBin, sessionName)
 			set custom title of launchedTab to sessionName
 			set title displays custom title of launchedTab to true
@@ -336,6 +330,57 @@ on defaultDangerousArgs(agentName)
 	if agentName is "gemini" then return "--yolo"
 	return ""
 end defaultDangerousArgs
+
+on openTerminalTab(targetWindowID, previousWindowIDs, previousTabCount)
+	-- Terminal drops the keystroke now and then, especially while it is busy
+	-- drawing the tab we opened a moment ago, so send it again before giving up.
+	repeat 2 times
+		my pressCommandT()
+		set launchedTab to my waitForNewTerminalTab(targetWindowID, previousWindowIDs, previousTabCount)
+		if launchedTab is not missing value then return launchedTab
+	end repeat
+	return missing value
+end openTerminalTab
+
+on pressCommandT()
+	tell application "Terminal" to activate
+	tell application "System Events"
+		tell process "Terminal"
+			repeat 20 times
+				if frontmost then exit repeat
+				try
+					set frontmost to true
+				end try
+				delay 0.1
+			end repeat
+			key code 17 using command down
+		end tell
+	end tell
+end pressCommandT
+
+on waitForNewTerminalTab(targetWindowID, previousWindowIDs, previousTabCount)
+	-- Depending on the window tabbing preference, Cmd-T lands as a tab in the
+	-- front window or as a whole new window. Watch for either, and keep watching
+	-- long enough for a loaded Mac to catch up.
+	repeat 30 times
+		delay 0.1
+		tell application "Terminal"
+			repeat with candidateWindow in windows
+				try
+					if (id of candidateWindow) is not in previousWindowIDs and (count of tabs of candidateWindow) > 0 then
+						return selected tab of candidateWindow
+					end if
+				end try
+			end repeat
+			try
+				if (count of tabs of window id targetWindowID) > previousTabCount then
+					return selected tab of window id targetWindowID
+				end if
+			end try
+		end tell
+	end repeat
+	return missing value
+end waitForNewTerminalTab
 
 on waitForTmuxClient(tmuxBin, sessionName)
 	repeat 20 times
