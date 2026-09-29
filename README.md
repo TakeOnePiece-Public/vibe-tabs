@@ -11,7 +11,7 @@ Running the launcher again selects the existing named Terminal tab. It does not 
 ## Install with Homebrew
 
 ```sh
-brew install takeonepiece/tap/vibe-tabs
+brew install takeonepiece-public/tap/vibe-tabs
 ```
 
 Your chosen coding CLIs must already be installed and authenticated. Homebrew installs `tmux`, `jq`, `yq`, and `ripgrep`.
@@ -218,7 +218,7 @@ The repository ignores local configs, environment files, agent histories, SQLite
 ## Source install
 
 ```sh
-git clone https://github.com/takeonepiece/vibe-tabs.git
+git clone https://github.com/TakeOnePiece-Public/vibe-tabs.git
 cd vibe-tabs
 ./install.sh
 ```

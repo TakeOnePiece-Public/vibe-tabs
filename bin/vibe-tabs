@@ -13,7 +13,7 @@ SCRIPT_PATH="${0:A}"
 PROJECT_ROOT="${SCRIPT_PATH:h:h}"
 DEFAULT_SESSION_COMMAND="$PROJECT_ROOT/bin/vibe-tab"
 SESSION_COMMAND="${VIBE_TABS_SESSION_COMMAND:-$DEFAULT_SESSION_COMMAND}"
-ISSUES_URL="https://github.com/TakeOnePiece/vibe-tabs/issues"
+ISSUES_URL="https://github.com/TakeOnePiece-Public/vibe-tabs/issues"
 ADD_COMMAND="${VIBE_TABS_ADD_COMMAND:-$PROJECT_ROOT/bin/vibe-tabs-add}"
 
 # Started from the macOS app or launchd, PATH is minimal and misses Homebrew.
