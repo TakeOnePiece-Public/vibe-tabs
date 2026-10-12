@@ -64,12 +64,18 @@ Launch everything:
 vibe-tabs
 ```
 
-Launch only some projects by naming them, with or without the suffix:
+Launch only some projects by naming them, with or without the suffix. Each one is created if it isn't running and connected to if it is; an open Terminal tab is selected rather than duplicated. `vibe-tab` (singular) does the same with names:
 
 ```sh
 vibe-tabs web
-vibe-tabs web research
+vibe-tab web research
 vibe-tabs ~/other-config.yml mobile
+```
+
+Or pick from a checklist of every session with its state (running, stopped, disabled, folder missing). Space ticks a session, `a` selects all, `n` none, `i` inverts, Enter opens the ticked ones, `q` cancels:
+
+```sh
+vibe-tab          # or: vibe-tabs pick
 ```
 
 Or open the bundled launcher app:
@@ -148,6 +154,10 @@ Each session requires:
 - `name`: stable session name before any suffix.
 - `path`: absolute or `~/` project folder. A relative path is resolved from the folder that holds the config.
 
+Optionally:
+
+- `enabled`: `false` keeps the session in the config but skips it when everything opens. Naming it (`vibe-tabs web`) still opens it.
+
 Per-session options override `defaults`. Existing tmux sessions remain untouched, so pane or layout changes take effect after that tmux session is removed.
 
 ## Commands
@@ -168,6 +178,22 @@ vibe-tab --layout tiled --profile Ocean web-m1-mbp ~/Code/example-web claude cod
 # Default to Claude + Codex and derive the name from the folder
 vibe-tab ~/Code/example-web
 ```
+
+Manage sessions without hand-editing YAML. Every change is checked by the launcher before it is written, and the previous config is kept as `~/.vibe-tabs.yml.bak`; comments and blank lines are preserved:
+
+```sh
+vibe-tabs list                     # name, state, folder and panes of every session (--json too)
+vibe-tabs show web                 # one entry and what it resolves to
+vibe-tabs set web --path ~/Code/web2 --panes claude,gemini --layout tiled
+vibe-tabs set web --panes default  # drop an override and inherit from defaults
+vibe-tabs set web --name website   # rename
+vibe-tabs disable research         # skip it when everything opens
+vibe-tabs enable research
+vibe-tabs rm research              # asks first; --yes to skip the question
+vibe-tabs edit web                 # open the config in $VISUAL/$EDITOR at that entry
+```
+
+`edit` works on a copy: when the result is invalid it says why and offers to edit again, and the config on disk is left as it was.
 
 Check a config without opening anything. This lists every session with its folder, layout, and panes:
 

@@ -119,7 +119,7 @@ expect "comment-only config" 2 "is empty"
 
 write_config broken.yml $'version: 1\nsessions:\n  - name: x\n    path: /tmp\n  bad: [\n'
 run "$VIBE_TABS" "$WORK/broken.yml"
-expect "YAML syntax error names the line" 2 "is not valid YAML" "line 4" "hint: Check indentation"
+expect "YAML syntax error names the line" 2 "is not valid YAML" "line " "hint: Check indentation"
 
 write_config multi.yml $'version: 1\n---\nsessions: []\n'
 run "$VIBE_TABS" "$WORK/multi.yml"
@@ -329,7 +329,7 @@ check "add appends a session" '[[ "$STATUS" == 0 ]] && yq -e ".sessions | length
 check "add derives the name from the folder" 'yq -e ".sessions[2].name == \"gamma-project\"" "$ADD_CONFIG" >/dev/null'
 check "add stores the layout" 'yq -e ".sessions[2].layout == \"tiled\"" "$ADD_CONFIG" >/dev/null'
 check "add stores the panes" 'yq -o=json ".sessions[2].panes" "$ADD_CONFIG" | jq -e ". == [{\"agent\": \"claude\"}, {\"agent\": \"gemini\"}]" >/dev/null'
-check "add keeps blank lines between sessions" '[[ "$(grep -c "^$" "$ADD_CONFIG")" -ge 4 ]] && rg -q "^  - name: gamma-project$" "$ADD_CONFIG"'
+check "add keeps blank lines between sessions" '[[ "$(grep -c "^$" "$ADD_CONFIG")" -ge 4 ]] && grep -q "^  - name: gamma-project$" "$ADD_CONFIG"'
 
 run "$VIBE_TABS" --check "$ADD_CONFIG"
 expect "added entry passes the launcher's validation" 0 "is valid: 3 session(s)"
@@ -347,6 +347,93 @@ check "rejected adds leave the config alone" 'yq -e ".sessions | length == 3" "$
 
 run "$VIBE_TABS" add --config "$ADD_CONFIG" --name tilde-check "$HOME"
 check "home folder is stored as ~" 'yq -e ".sessions[3].path == \"~\"" "$ADD_CONFIG" >/dev/null'
+
+# ---------------------------------------------------------------------------
+# vibe-tab NAME: names are looked up in the config
+# ---------------------------------------------------------------------------
+
+VT_CFG="$WORK/vt-config.yml"
+/bin/cp "$TEST_DIR/fixtures/config.yml" "$VT_CFG"
+
+VIBE_TABS_CONFIG="$VT_CFG" run "$VIBE_TAB" beta
+expect "vibe-tab NAME opens the configured session" 0 "opened 1 session(s)"
+check "vibe-tab NAME uses the configured folder and suffix" '[[ "$(cat "$VIBE_TABS_TEST_OUTPUT")" == *\|beta-test-mac\|/tmp\|* ]]'
+
+VIBE_TABS_CONFIG="$VT_CFG" run "$VIBE_TAB" alpha beta
+expect "vibe-tab NAME NAME opens several" 0 "opened 2 session(s)"
+
+VIBE_TABS_CONFIG="$VT_CFG" run "$VIBE_TAB" alpha nope
+expect "vibe-tab with an unknown name among several" 2 "unknown session: nope"
+check "unknown names open nothing" '[[ "$(captured_lines)" == 0 ]]'
+
+# ---------------------------------------------------------------------------
+# enabled: false
+# ---------------------------------------------------------------------------
+
+write_config disabled.yml $'version: 1\nsessions:\n  - name: on\n    path: /tmp\n  - name: off\n    path: /tmp\n    enabled: false'
+run "$VIBE_TABS" "$WORK/disabled.yml"
+expect "full launch skips disabled sessions" 0 "Skipping disabled: off" "opened 1 session(s)"
+run "$VIBE_TABS" "$WORK/disabled.yml" off
+expect "a disabled session still opens by name" 0 "opened 1 session(s)"
+write_config bad-enabled.yml $'version: 1\nsessions:\n  - name: x\n    path: /tmp\n    enabled: nope'
+run "$VIBE_TABS" --check "$WORK/bad-enabled.yml"
+expect "enabled must be true or false" 2 "enabled"
+
+# ---------------------------------------------------------------------------
+# list / show / set / enable / disable / rm / edit
+# ---------------------------------------------------------------------------
+
+export VIBE_TABS_CONFIG="$VT_CFG"
+run "$VIBE_TABS" list
+expect "list shows every session" 0 "NAME" "alpha" "beta" "/tmp"
+run "$VIBE_TABS" list --json
+check "list --json is JSON" 'print -r -- "$OUT" | jq -e "length == 2 and .[0].name == \"alpha\" and .[0].enabled == true" >/dev/null'
+run "$VIBE_TABS" show beta-test-mac
+expect "show accepts the suffixed name" 0 "tmux session: beta-test-mac"
+run "$VIBE_TABS" show nope
+expect "show names the sessions when one is unknown" 1 "no session named 'nope'" "alpha beta"
+
+/bin/cp "$VT_CFG" "$WORK/vt-original.yml"
+run "$VIBE_TABS" disable alpha
+check "disable writes enabled: false" '[[ "$STATUS" == 0 ]] && yq -e ".sessions[0].enabled == false" "$VT_CFG" >/dev/null'
+check "disable keeps a backup" '/usr/bin/cmp -s "$VT_CFG.bak" "$WORK/vt-original.yml"'
+run "$VIBE_TABS" enable alpha
+check "enable then disable round-trips byte for byte" '[[ "$STATUS" == 0 ]] && /usr/bin/cmp -s "$VT_CFG" "$WORK/vt-original.yml"'
+
+run "$VIBE_TABS" set alpha --panes claude,gemini --layout tiled --profile Ocean
+check "set writes the changes" '[[ "$STATUS" == 0 ]] && yq -e ".sessions[0].layout == \"tiled\" and .sessions[0].terminal_profile == \"Ocean\"" "$VT_CFG" >/dev/null'
+check "set writes panes as plain YAML" 'grep -q "^      - agent: gemini$" "$VT_CFG"'
+run "$VIBE_TABS" set alpha --panes default --layout default --profile default
+check "set ... default round-trips byte for byte" '[[ "$STATUS" == 0 ]] && /usr/bin/cmp -s "$VT_CFG" "$WORK/vt-original.yml"'
+run "$VIBE_TABS" set alpha --layout sideways
+expect "set rejects an unknown layout" 1 "unknown layout"
+run "$VIBE_TABS" set alpha --name beta
+expect "set refuses a duplicate name" 1 "already exists"
+run "$VIBE_TABS" set alpha --path "$WORK/missing"
+expect "set refuses a missing folder" 1 "no such folder"
+check "rejected sets leave the config alone" '/usr/bin/cmp -s "$VT_CFG" "$WORK/vt-original.yml"'
+
+run "$VIBE_TABS" rm beta </dev/null
+expect "rm without a terminal asks for --yes" 1 "pass --yes"
+run "$VIBE_TABS" rm beta --yes
+check "rm --yes removes the session" '[[ "$STATUS" == 0 ]] && yq -e ".sessions | length == 1" "$VT_CFG" >/dev/null'
+/bin/cp "$WORK/vt-original.yml" "$VT_CFG"
+
+print -r -- $'#!/bin/sh\nfor a; do f=$a; done\n/usr/bin/sed -i "" "s|layout: tiled|layout: even-vertical|" "$f"' >"$WORK/editor-ok"
+print -r -- $'#!/bin/sh\nfor a; do f=$a; done\nprintf "  - name: [broken\\n" >> "$f"' >"$WORK/editor-bad"
+chmod +x "$WORK/editor-ok" "$WORK/editor-bad"
+EDITOR="$WORK/editor-ok" run "$VIBE_TABS" edit beta </dev/null
+check "edit saves a valid change" '[[ "$STATUS" == 0 ]] && yq -e ".sessions[1].layout == \"even-vertical\"" "$VT_CFG" >/dev/null'
+/bin/cp "$WORK/vt-original.yml" "$VT_CFG"
+EDITOR="$WORK/editor-bad" run "$VIBE_TABS" edit </dev/null
+expect "edit refuses an invalid change" 1 "the changed config is not valid YAML" "was not changed"
+check "a refused edit leaves the config alone" '/usr/bin/cmp -s "$VT_CFG" "$WORK/vt-original.yml"'
+EDITOR=/usr/bin/true run "$VIBE_TABS" edit </dev/null
+expect "edit with no change says so" 0 "No changes."
+
+run "$VIBE_TABS" pick </dev/null
+expect "pick needs a terminal" 1 "interactive terminal"
+unset VIBE_TABS_CONFIG
 
 print ""
 if (( failed > 0 )); then

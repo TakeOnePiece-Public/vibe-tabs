@@ -1,0 +1,550 @@
+#!/bin/zsh
+# vibe-tabs-config: list, show, change, enable, disable and remove sessions in the
+# Vibe Tabs config, or open it in an editor. Reached through `vibe-tabs <command>`.
+#
+# Every change is staged in a copy, checked by the launcher itself, and only then
+# written; the previous config is kept as <config>.bak.
+
+set -uo pipefail
+
+PROG="vibe-tabs"
+SCRIPT_PATH="${0:A}"
+PROJECT_ROOT="${SCRIPT_PATH:h:h}"
+LAUNCHER="${VIBE_TABS_LAUNCHER:-$PROJECT_ROOT/bin/vibe-tabs}"
+KNOWN_LAYOUTS=(auto even-horizontal even-vertical main-horizontal main-vertical tiled)
+
+usage() {
+  cat <<'EOF'
+Usage: vibe-tabs pick
+       vibe-tabs list [--json]
+       vibe-tabs show NAME
+       vibe-tabs set NAME [--name NEW] [--path FOLDER] [--panes a,b] [--layout L] [--profile P]
+       vibe-tabs enable NAME ...
+       vibe-tabs disable NAME ...
+       vibe-tabs rm NAME [--yes]
+       vibe-tabs edit [NAME]
+
+  pick      tick sessions in a checklist (all, none or some), then open and
+            connect to them; also what `vibe-tab` with no arguments does
+  list      every session with its folder, panes and state (running, stopped,
+            disabled, or folder missing)
+  show      one session's entry and what it resolves to
+  set       change a session; pass "default" to --panes, --layout or --profile
+            to drop the override and inherit from defaults
+  enable    put disabled sessions back into `vibe-tabs`
+  disable   keep sessions in the config but skip them when everything opens;
+            `vibe-tabs NAME` still opens a disabled session
+  rm        delete sessions from the config (asks first unless --yes)
+  edit      open the config in $VISUAL or $EDITOR (at NAME's entry, when given);
+            the edit is checked before it replaces the config
+
+NAME is the session name from the config, with or without the suffix.
+All commands accept --config FILE (default ~/.vibe-tabs.yml, or $VIBE_TABS_CONFIG).
+EOF
+}
+
+err()  { print -ru2 -- "$PROG: error: $*"; }
+hint() { print -ru2 -- "  hint: $*"; }
+die()  { local message=$1; shift; err "$message"; local line; for line in "$@"; do hint "$line"; done; exit 1; }
+
+pretty_path() {
+  if [[ "$1" == "$HOME" ]]; then print -r -- "~"
+  elif [[ "$1" == "$HOME"/* ]]; then print -r -- "~/${1#$HOME/}"
+  else print -r -- "$1"; fi
+}
+
+# Same rules as slugify() in bin/vibe-tabs, so names match tmux.
+slugify() {
+  print -rn -- "$1" | /usr/bin/tr -cs '[:alnum:]_-' '-' | /usr/bin/sed 's/^-*//; s/-*$//'
+}
+
+# ---------------------------------------------------------------------------
+# Arguments: the command, then options and names in any order.
+# ---------------------------------------------------------------------------
+
+command_name="${1-}"
+[[ -n "$command_name" ]] || { usage >&2; exit 2; }
+shift
+[[ "$command_name" == "remove" ]] && command_name="rm"
+[[ "$command_name" == "ls" ]] && command_name="list"
+
+config_file="${VIBE_TABS_CONFIG:-}"
+json=false
+assume_yes=false
+typeset -a names
+typeset -A changes
+
+need_value() { (( $2 >= 2 )) || die "$1 needs a value"; }
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --config)  need_value "$1" $#; config_file=$2; shift ;;
+    --json)    json=true ;;
+    --yes|-y)  assume_yes=true ;;
+    --name|--path|--panes|--layout|--profile)
+      [[ "$command_name" == "set" ]] || die "$1 only works with: vibe-tabs set NAME $1 ..."
+      need_value "$1" $#; changes[${1#--}]=$2; shift ;;
+    -*) die "unknown option: $1" "run: vibe-tabs $command_name --help" ;;
+    *)  names+=("$1") ;;
+  esac
+  shift
+done
+
+yq_bin="$(whence -p yq)" || die "yq is not installed" "brew install yq"
+jq_bin="$(whence -p jq)" || die "jq is not installed" "brew install jq"
+
+if [[ -z "$config_file" ]]; then
+  if [[ -f "$HOME/.vibe-tabs.yaml" && ! -f "$HOME/.vibe-tabs.yml" ]]; then
+    config_file="$HOME/.vibe-tabs.yaml"
+  else
+    config_file="$HOME/.vibe-tabs.yml"
+  fi
+fi
+config_file="${config_file/#\~/$HOME}"
+[[ -f "$config_file" ]] || die "no config at $(pretty_path "$config_file")" "add a project with: vibe-tabs add /path/to/project"
+config_label="$(pretty_path "$config_file")"
+
+config_json="$("$yq_bin" -o=json -I0 '.' "$config_file" 2>&1)" || die "$config_label is not valid YAML: $config_json" "check it with: vibe-tabs --check"
+
+# One row per session: index, raw name, short slug, full tmux name, path, enabled.
+session_rows() {
+  "$jq_bin" -r '
+    (.defaults.session_suffix // "") as $suffix |
+    (.sessions // []) | to_entries[] |
+    [.key, (.value.name // ""), (.value.session_suffix // $suffix), (.value.path // ""), (.value.enabled != false | tostring)] | @tsv
+  ' <<<"$config_json"
+}
+
+typeset -a row_index row_raw row_short row_full row_path row_enabled
+while IFS=$'\t' read -r idx raw suffix spath enabled; do
+  [[ -n "$idx" ]] || continue
+  full="$raw"
+  [[ -n "$suffix" && "$full" != *-"$suffix" ]] && full="$full-$suffix"
+  row_index+=("$idx"); row_raw+=("$raw"); row_short+=("$(slugify "$raw")")
+  row_full+=("$(slugify "$full")"); row_path+=("$spath"); row_enabled+=("$enabled")
+done < <(session_rows)
+
+# find_session NAME -> sets FOUND (1-based position in the row arrays) or exits.
+find_session() {
+  local wanted
+  wanted="$(slugify "$1")"
+  for (( FOUND = 1; FOUND <= ${#row_index}; FOUND++ )); do
+    [[ "$wanted" == "${row_short[FOUND]}" || "$wanted" == "${row_full[FOUND]}" ]] && return 0
+  done
+  die "no session named '$1' in $config_label" "sessions: ${(j: :)row_short}" "list them with: vibe-tabs list"
+}
+
+expand_path() {
+  case "$1" in
+    "~") print -r -- "$HOME" ;;
+    "~/"*) print -r -- "$HOME/${1#\~/}" ;;
+    /*) print -r -- "$1" ;;
+    *) print -r -- "${config_file:h}/$1" ;;
+  esac
+}
+
+tmux_running() {
+  local tmux_bin
+  tmux_bin="$(whence -p tmux)" || return 1
+  "$tmux_bin" has-session -t "=$1" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Writing: stage, validate with the launcher, keep a backup, replace.
+# ---------------------------------------------------------------------------
+
+had_blank_lines=false
+/usr/bin/grep -q '^[[:space:]]*$' "$config_file" && had_blank_lines=true
+
+# yq drops blank lines and indents a comment that sat between two sessions (such
+# as a commented-out session) under the one before it. Put back the blank lines
+# between top-level blocks and sessions, and move such comments back out to the
+# list's indent, in their own paragraph.
+restore_blank_lines() {
+  /usr/bin/awk '
+    function flush(as_item_header,   j) {
+      if (pending == 0) return
+      if (as_item_header) {
+        if (seen_item) print ""
+        for (j = 1; j <= pending; j++) { line = buffered[j]; sub(/^[[:space:]]+#/, "  #", line); print line }
+      } else {
+        for (j = 1; j <= pending; j++) print buffered[j]
+      }
+      pending = 0
+    }
+    /^[[:space:]]+#/ { buffered[++pending] = $0; next }
+    /^  - / {
+      had_comments = pending > 0
+      flush(1)
+      if (seen_item || had_comments) print ""
+      seen_item = 1
+      print
+      next
+    }
+    {
+      flush(0)
+      if (NR > 1 && /^[^[:space:]#-]/) print ""
+      if (/^[^[:space:]#-]/) seen_item = 0
+      print
+    }
+    END { flush(0) }
+  ' "$1" >"$1.styled" && /bin/mv "$1.styled" "$1"
+}
+
+# validate FILE: the launcher exits 2 for a config it refuses; 1 only means a
+# project folder is missing, which a config may legitimately contain.
+validate() {
+  local output rc
+  output="$(VIBE_TABS_SESSION_COMMAND=/usr/bin/true "$LAUNCHER" --check "$1" 2>&1)"
+  rc=$?
+  (( rc != 2 )) && return 0
+  # The launcher names the staged copy (macOS may show it under /private); say
+  # "the changed config" so nobody thinks the file on disk is already broken.
+  print -r -- "$output" | /usr/bin/sed -e "s|/private$1|the changed config|g" -e "s|$1|the changed config|g" >&2
+  return 1
+}
+
+install_config() {
+  /bin/cp "$config_file" "$config_file.bak"
+  /bin/cat "$1" >"$config_file"
+  /bin/rm -f "$1"
+}
+
+# apply_change YQ_EXPRESSION [ENV=VALUE ...]: edit a staged copy and install it.
+apply_change() {
+  local expression=$1 staged
+  shift
+  staged="$(/usr/bin/mktemp -t vibe-tabs-config)" || die "could not create a temporary file"
+  /bin/cp "$config_file" "$staged"
+  if ! env "$@" "$yq_bin" -i "$expression" "$staged" 2>"$staged.err"; then
+    local message="$(<"$staged.err")"
+    /bin/rm -f "$staged" "$staged.err"
+    die "could not change $config_label: $message"
+  fi
+  /bin/rm -f "$staged.err"
+  [[ "$had_blank_lines" == true ]] && restore_blank_lines "$staged"
+  if ! validate "$staged"; then
+    /bin/rm -f "$staged"
+    die "that change would make $config_label invalid, so nothing was written"
+  fi
+  install_config "$staged"
+}
+
+saved_note() { print -r -- "Saved $config_label (previous version: $config_label.bak)"; }
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+# compute_states -> fills the global states array, one entry per session.
+typeset -a states
+compute_states() {
+  local i folder
+  states=()
+  for (( i = 1; i <= ${#row_index}; i++ )); do
+    folder="$(expand_path "${row_path[i]}")"
+    if tmux_running "${row_full[i]}"; then states+=(running)
+    elif [[ "${row_enabled[i]}" != true ]]; then states+=(disabled)
+    elif [[ ! -d "$folder" ]]; then states+=(no-folder)
+    else states+=(stopped); fi
+  done
+}
+
+cmd_list() {
+  (( ${#names} == 0 )) || die "list takes no session names" "use: vibe-tabs show NAME"
+  local i panes
+  compute_states
+
+  local panes_json
+  panes_json="$("$jq_bin" -c '
+    (.defaults.panes // ["claude", "codex"]) as $default |
+    [(.sessions // [])[] | [(.panes // $default)[] | if type == "string" then . else (.title // .agent // .command // "?") end] | join(",")]
+  ' <<<"$config_json")"
+
+  if [[ "$json" == true ]]; then
+    local states_json
+    states_json="$(printf '%s\n' "${states[@]}" | "$jq_bin" -R . | "$jq_bin" -sc .)"
+    "$jq_bin" --argjson states "$states_json" --argjson panes "$panes_json" '
+      (.defaults.session_suffix // "") as $suffix |
+      [(.sessions // []) | to_entries[] | .key as $i | .value |
+        {name, path, enabled: (.enabled != false), state: $states[$i], panes: ($panes[$i] | split(","))}]
+    ' <<<"$config_json"
+    return
+  fi
+
+  {
+    print -r -- $'NAME\tSTATE\tFOLDER\tPANES'
+    for (( i = 1; i <= ${#row_index}; i++ )); do
+      panes="$("$jq_bin" -r --argjson i $(( i - 1 )) '.[$i]' <<<"$panes_json")"
+      print -r -- "${row_short[i]}"$'\t'"${states[i]}"$'\t'"${row_path[i]}"$'\t'"$panes"
+    done
+  } | /usr/bin/column -t -s $'\t'
+}
+
+cmd_show() {
+  (( ${#names} == 1 )) || die "show takes one session name"
+  find_session "${names[1]}"
+  local i=$FOUND folder
+  folder="$(expand_path "${row_path[i]}")"
+  "$yq_bin" ".sessions[${row_index[i]}]" "$config_file" | /usr/bin/sed 's/^/  /'
+  print -r -- "tmux session: ${row_full[i]}$(tmux_running "${row_full[i]}" && print -n ' (running)')"
+  print -r -- "folder:       $(pretty_path "$folder")$([[ -d "$folder" ]] || print -n '  (missing)')"
+  [[ "${row_enabled[i]}" == true ]] || print -r -- "disabled:     skipped by vibe-tabs; vibe-tabs ${row_short[i]} still opens it"
+}
+
+cmd_set() {
+  (( ${#names} == 1 )) || die "set takes one session name" "example: vibe-tabs set amelio --path ~/Projects/photo-studio"
+  (( ${#changes} > 0 )) || die "nothing to change" "pass --name, --path, --panes, --layout or --profile"
+  find_session "${names[1]}"
+  local i=$FOUND expression="." value
+  typeset -a env_args
+
+  if [[ -n "${changes[name]-}" ]]; then
+    value="$(slugify "${changes[name]}")"
+    [[ -n "$value" ]] || die "--name needs a letter or number"
+    local j
+    for (( j = 1; j <= ${#row_index}; j++ )); do
+      (( j != i )) && [[ "$value" == "${row_short[j]}" ]] && die "a session named '$value' already exists"
+    done
+    expression+=" | .sessions[${row_index[i]}].name = strenv(VT_NAME)"; env_args+=("VT_NAME=$value")
+  fi
+  if [[ -n "${changes[path]-}" ]]; then
+    value="$(expand_path "${changes[path]/#\~/$HOME}")"
+    [[ -d "$value" ]] || die "no such folder: $(pretty_path "$value")"
+    value="$(pretty_path "${value:A}")"
+    expression+=" | .sessions[${row_index[i]}].path = strenv(VT_PATH)"; env_args+=("VT_PATH=$value")
+  fi
+  if [[ -n "${changes[layout]-}" ]]; then
+    if [[ "${changes[layout]}" == default ]]; then
+      expression+=" | del(.sessions[${row_index[i]}].layout)"
+    else
+      (( ${KNOWN_LAYOUTS[(Ie)${changes[layout]}]} )) || die "unknown layout: ${changes[layout]}" "use one of: ${KNOWN_LAYOUTS[*]} (or default)"
+      expression+=" | .sessions[${row_index[i]}].layout = strenv(VT_LAYOUT)"; env_args+=("VT_LAYOUT=${changes[layout]}")
+    fi
+  fi
+  if [[ -n "${changes[profile]-}" ]]; then
+    if [[ "${changes[profile]}" == default ]]; then
+      expression+=" | del(.sessions[${row_index[i]}].terminal_profile)"
+    else
+      expression+=" | .sessions[${row_index[i]}].terminal_profile = strenv(VT_PROFILE)"; env_args+=("VT_PROFILE=${changes[profile]}")
+    fi
+  fi
+  if [[ -n "${changes[panes]-}" ]]; then
+    if [[ "${changes[panes]}" == default ]]; then
+      expression+=" | del(.sessions[${row_index[i]}].panes)"
+    else
+      local pane panes_json
+      typeset -a pane_list
+      pane_list=("${(@s:,:)changes[panes]}")
+      for pane in "${pane_list[@]}"; do
+        [[ "$pane" =~ '^[A-Za-z0-9_.-]+$' ]] || die "invalid agent name in --panes: '$pane'" "use agent names separated by commas, such as claude,codex"
+      done
+      panes_json="$(printf '%s\n' "${pane_list[@]}" | "$jq_bin" -R '{agent: .}' | "$jq_bin" -sc .)"
+      expression+=" | .sessions[${row_index[i]}].panes = env(VT_PANES)"; env_args+=("VT_PANES=$panes_json")
+    fi
+  fi
+
+  apply_change "$expression | (.sessions[${row_index[i]}] | ...) style = \"\"" "${env_args[@]}"
+  print -r -- "Updated '${changes[name]:-${row_short[i]}}'"
+  saved_note
+  if tmux_running "${row_full[i]}"; then
+    print -r -- "Note: ${row_full[i]} is running; the change applies the next time it opens."
+  fi
+}
+
+cmd_enable_disable() {
+  (( ${#names} > 0 )) || die "$command_name needs at least one session name"
+  local name expression="." i
+  typeset -a done_names
+  for name in "${names[@]}"; do
+    find_session "$name"
+    i=$FOUND
+    if [[ "$command_name" == disable ]]; then
+      expression+=" | .sessions[${row_index[i]}].enabled = false"
+    else
+      expression+=" | del(.sessions[${row_index[i]}].enabled)"
+    fi
+    done_names+=("${row_short[i]}")
+  done
+  apply_change "$expression"
+  print -r -- "${(C)command_name}d: ${(j: :)done_names}"
+  saved_note
+}
+
+cmd_rm() {
+  (( ${#names} > 0 )) || die "rm needs at least one session name"
+  local name i
+  typeset -a indexes removed
+  for name in "${names[@]}"; do
+    find_session "$name"
+    indexes+=("${row_index[FOUND]}")
+    removed+=("${row_short[FOUND]} ($(pretty_path "$(expand_path "${row_path[FOUND]}")"))")
+  done
+  if [[ "$assume_yes" != true ]]; then
+    [[ -t 0 ]] || die "refusing to remove sessions without confirmation" "pass --yes to remove: ${(j:, :)removed}"
+    print -rn -- "Remove ${(j:, :)removed} from $config_label? [y/N] "
+    local answer
+    read -r answer
+    [[ "$answer" == [yY]* ]] || { print -r -- "Nothing removed."; exit 0; }
+  fi
+  # Delete from the highest index down so earlier deletions don't shift later ones.
+  local expression="."
+  for i in ${(On)indexes}; do
+    expression+=" | del(.sessions[$i])"
+  done
+  apply_change "$expression"
+  print -r -- "Removed: ${(j:, :)removed}"
+  saved_note
+}
+
+cmd_edit() {
+  (( ${#names} <= 1 )) || die "edit takes at most one session name"
+  local line=""
+  if (( ${#names} == 1 )); then
+    find_session "${names[1]}"
+    line="$(/usr/bin/grep -n -E "^[[:space:]]*-[[:space:]]+name:[[:space:]]*[\"']?${row_raw[FOUND]}[\"']?[[:space:]]*$" "$config_file" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
+  fi
+
+  local editor="${VISUAL:-${EDITOR:-}}"
+  [[ -n "$editor" ]] || editor=vi
+  local staged
+  staged="$(/usr/bin/mktemp -t vibe-tabs-edit)" || die "could not create a temporary file"
+  /bin/mv "$staged" "$staged.yml"
+  staged="$staged.yml"
+  /bin/cp "$config_file" "$staged"
+
+  while true; do
+    typeset -a editor_cmd
+    editor_cmd=(${(z)editor})
+    if [[ -n "$line" ]]; then
+      case "${editor_cmd[1]:t}" in
+        vi|vim|nvim|nano|emacs|micro|hx|kak|mate) editor_cmd+=("+$line" "$staged") ;;
+        code|cursor|windsurf|zed) editor_cmd+=(--wait -g "$staged:$line") ;;
+        subl) editor_cmd+=(--wait "$staged:$line") ;;
+        *) editor_cmd+=("$staged") ;;
+      esac
+    else
+      case "${editor_cmd[1]:t}" in
+        code|cursor|windsurf|zed|subl) editor_cmd+=(--wait "$staged") ;;
+        *) editor_cmd+=("$staged") ;;
+      esac
+    fi
+    "${editor_cmd[@]}" || die "the editor ($editor) exited with an error; $config_label was not changed" "your edit is kept in $staged"
+
+    if /usr/bin/cmp -s "$staged" "$config_file"; then
+      /bin/rm -f "$staged"
+      print -r -- "No changes."
+      return
+    fi
+    if validate "$staged"; then
+      install_config "$staged"
+      saved_note
+      return
+    fi
+    if [[ -t 0 ]]; then
+      print -rn -- "Edit again? [Y/n] "
+      local answer
+      read -r answer
+      [[ "$answer" == [nN]* ]] || continue
+    fi
+    die "$config_label was not changed" "your edit is kept in $staged"
+  done
+}
+
+# Interactive checklist on the terminal. Ticked sessions are handed to the launcher,
+# which creates any that are not running and connects to all of them.
+cmd_pick() {
+  (( ${#names} == 0 )) || die "pick takes no session names" "to open sessions directly: vibe-tabs NAME ..."
+  (( ${#row_index} > 0 )) || die "$config_label has no sessions" "add one with: vibe-tabs add /path/to/project"
+  [[ -t 0 && -t 1 ]] || die "pick needs an interactive terminal" "to open sessions directly: vibe-tabs NAME ..."
+  compute_states
+
+  local count=${#row_index} cursor=1 top=1 key rest i mark line width=0 tty=/dev/tty
+  typeset -a picked
+  for (( i = 1; i <= count; i++ )); do
+    picked[i]=0
+    (( ${#row_short[i]} > width )) && width=${#row_short[i]}
+  done
+  local rows=$(( ${LINES:-$(/usr/bin/tput lines 2>/dev/null || print 24)} - 4 ))
+  (( rows < 3 )) && rows=3
+  (( rows > count )) && rows=$count
+  local drawn=0
+
+  local saved_stty
+  saved_stty="$(/bin/stty -g <$tty)"
+  restore_tty() { /bin/stty "$saved_stty" <$tty; print -n -- $'\e[?25h' >$tty; }
+  trap 'restore_tty; print >$tty; exit 130' INT TERM
+  /bin/stty -echo -icanon <$tty
+  print -n -- $'\e[?25l' >$tty
+
+  draw() {
+    (( drawn > 0 )) && print -n -- $'\e['"$drawn"'A' >$tty
+    local selected=0 color
+    for (( i = 1; i <= count; i++ )); do (( picked[i] )) && (( selected++ )); done
+    print -r -- $'\e[2K\e[1m'"Pick sessions to open"$'\e[0m'"  ($selected of $count selected)" >$tty
+    for (( i = top; i < top + rows; i++ )); do
+      (( picked[i] )) && mark=$'\e[32m[x]\e[0m' || mark='[ ]'
+      case "${states[i]}" in
+        running) color=$'\e[32m' ;; disabled|no-folder) color=$'\e[2m' ;; *) color='' ;;
+      esac
+      line="$mark ${(r:$width:)row_short[i]}  ${color}${(r:9:)states[i]}"$'\e[0m'"  $(pretty_path "$(expand_path "${row_path[i]}")")"
+      if (( i == cursor )); then
+        print -r -- $'\e[2K\e[7m'"> "$'\e[0m'"$line" >$tty
+      else
+        print -r -- $'\e[2K'"  $line" >$tty
+      fi
+    done
+    print -r -- $'\e[2K\e[2m'"space toggle · a all · n none · i invert · enter open · q cancel"$'\e[0m' >$tty
+    drawn=$(( rows + 2 ))
+  }
+
+  while true; do
+    (( cursor < top )) && top=$cursor
+    (( cursor >= top + rows )) && top=$(( cursor - rows + 1 ))
+    draw
+    read -rs -k 1 key <$tty
+    if [[ "$key" == $'\e' ]]; then
+      # Arrow keys arrive as ESC [ A/B; a lone ESC cancels.
+      rest=""
+      read -rs -k 2 -t 0.05 rest <$tty
+      case "$rest" in
+        '[A'|'OA') key=up ;;
+        '[B'|'OB') key=down ;;
+        '') key=q ;;
+        *) continue ;;
+      esac
+    fi
+    case "$key" in
+      up|k) (( cursor > 1 )) && (( cursor-- )) ;;
+      down|j) (( cursor < count )) && (( cursor++ )) ;;
+      ' '|x) picked[cursor]=$(( 1 - picked[cursor] )); (( cursor < count )) && (( cursor++ )) ;;
+      a|A) for (( i = 1; i <= count; i++ )); do picked[i]=1; done ;;
+      n|N) for (( i = 1; i <= count; i++ )); do picked[i]=0; done ;;
+      i|I) for (( i = 1; i <= count; i++ )); do picked[i]=$(( 1 - picked[i] )); done ;;
+      $'\n'|$'\r') break ;;
+      q|Q) restore_tty; trap - INT TERM; print -r -- "Cancelled; nothing opened."; exit 0 ;;
+    esac
+  done
+  restore_tty
+  trap - INT TERM
+
+  typeset -a chosen
+  for (( i = 1; i <= count; i++ )); do (( picked[i] )) && chosen+=("${row_short[i]}"); done
+  if (( ${#chosen} == 0 )); then
+    print -r -- "Nothing selected; nothing opened."
+    exit 0
+  fi
+  print -r -- "Opening: ${(j: :)chosen}"
+  exec "$LAUNCHER" "$config_file" "${chosen[@]}"
+}
+
+case "$command_name" in
+  pick) cmd_pick ;;
+  list) cmd_list ;;
+  show) cmd_show ;;
+  set) cmd_set ;;
+  enable|disable) cmd_enable_disable ;;
+  rm) cmd_rm ;;
+  edit) cmd_edit ;;
+  *) err "unknown command: $command_name"; usage >&2; exit 2 ;;
+esac
