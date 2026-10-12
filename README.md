@@ -58,10 +58,11 @@ sessions:
         title: deepseek
 ```
 
-Launch everything:
+Launch from a checklist of every session, with the enabled ones already ticked: press Enter to open them all, or change the ticks first (Space ticks, `a` all, `n` none, `i` invert, `q` cancels). `--all` skips the checklist; the Vibe Tabs app and anything not run from a terminal open every enabled session without asking:
 
 ```sh
 vibe-tabs
+vibe-tabs --all
 ```
 
 Launch only some projects by naming them, with or without the suffix. Each one is created if it isn't running and connected to if it is; an open Terminal tab is selected rather than duplicated. `vibe-tab` (singular) does the same with names:
@@ -72,7 +73,7 @@ vibe-tab web research
 vibe-tabs ~/other-config.yml mobile
 ```
 
-Or pick from a checklist of every session with its state (running, stopped, disabled, folder missing). Space ticks a session, `a` selects all, `n` none, `i` inverts, Enter opens the ticked ones, `q` cancels:
+`vibe-tab` with no arguments shows the same checklist with nothing ticked, for opening just a few:
 
 ```sh
 vibe-tab          # or: vibe-tabs pick

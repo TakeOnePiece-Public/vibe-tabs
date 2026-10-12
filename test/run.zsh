@@ -433,6 +433,11 @@ expect "edit with no change says so" 0 "No changes."
 
 run "$VIBE_TABS" pick </dev/null
 expect "pick needs a terminal" 1 "interactive terminal"
+run "$VIBE_TABS" --all "$TEST_DIR/fixtures/config.yml"
+expect "--all opens every session" 0 "opened 2 session(s)"
+run "$VIBE_TABS" pick --ticked some </dev/null
+expect "pick --ticked takes none, enabled or all" 1 "--ticked takes none, enabled or all"
+
 unset VIBE_TABS_CONFIG
 
 print ""

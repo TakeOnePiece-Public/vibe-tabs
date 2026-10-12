@@ -25,7 +25,8 @@ Usage: vibe-tabs pick
        vibe-tabs edit [NAME]
 
   pick      tick sessions in a checklist (all, none or some), then open and
-            connect to them; also what `vibe-tab` with no arguments does
+            connect to them; also what `vibe-tab` and `vibe-tabs` do with no
+            arguments. --ticked none|enabled|all sets the starting ticks
   list      every session with its folder, panes and state (running, stopped,
             disabled, or folder missing)
   show      one session's entry and what it resolves to
@@ -70,6 +71,7 @@ shift
 
 config_file="${VIBE_TABS_CONFIG:-}"
 json=false
+ticked=none
 assume_yes=false
 typeset -a names
 typeset -A changes
@@ -80,6 +82,8 @@ while (( $# > 0 )); do
     -h|--help) usage; exit 0 ;;
     --config)  need_value "$1" $#; config_file=$2; shift ;;
     --json)    json=true ;;
+    --ticked)  need_value "$1" $#; ticked=$2; shift
+               [[ "$ticked" == (none|enabled|all) ]] || die "--ticked takes none, enabled or all" ;;
     --yes|-y)  assume_yes=true ;;
     --name|--path|--panes|--layout|--profile)
       [[ "$command_name" == "set" ]] || die "$1 only works with: vibe-tabs set NAME $1 ..."
@@ -462,7 +466,11 @@ cmd_pick() {
   local count=${#row_index} cursor=1 top=1 key rest i mark line width=0 tty=/dev/tty
   typeset -a picked
   for (( i = 1; i <= count; i++ )); do
-    picked[i]=0
+    case "$ticked" in
+      all) picked[i]=1 ;;
+      enabled) [[ "${row_enabled[i]}" == true ]] && picked[i]=1 || picked[i]=0 ;;
+      *) picked[i]=0 ;;
+    esac
     (( ${#row_short[i]} > width )) && width=${#row_short[i]}
   done
   local rows=$(( ${LINES:-$(/usr/bin/tput lines 2>/dev/null || print 24)} - 4 ))

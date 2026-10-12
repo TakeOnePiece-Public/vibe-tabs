@@ -62,11 +62,15 @@ usage() {
   cat <<'EOF'
 Usage: vibe-tabs [options] [config.yml] [session ...]
        vibe-tabs add [options] [folder ...]
+       vibe-tabs pick|list|show|set|enable|disable|rm|edit ...   (see vibe-tabs list --help)
 
-Open every session in the config as a named tmux workspace in Terminal.
+In a terminal, vibe-tabs shows a checklist of the sessions in the config, with
+the enabled ones ticked: press Enter to open them, or change the ticks first.
 Name one or more sessions, with or without the suffix, to open only those.
 
 Options:
+  --all        Open every enabled session without asking (the default when not
+               run from a terminal, such as from the Vibe Tabs app)
   --check      Validate the config and list the sessions without opening anything
   --app        Open the Vibe Tabs macOS app
   -h, --help   Show this help
@@ -130,6 +134,7 @@ slugify() {
 # ---------------------------------------------------------------------------
 
 check_only=false
+open_all=false
 config_file=""
 typeset -a requested_names
 
@@ -151,6 +156,7 @@ while (( $# > 0 )); do
     -h|--help) usage; exit 0 ;;
     --app) open_app ;;
     --check) check_only=true ;;
+    --all) open_all=true ;;
     --) shift; break ;;
     -*) usage_error "unknown option: $1" ;;
     *) take_positional "$1" ;;
@@ -543,6 +549,13 @@ done <"$work_dir/sessions.jsonl"
 if (( config_errors > 0 )); then
   print -u2 "$PROG: $config_errors problem(s) in $config_label; nothing was opened."
   exit 2
+fi
+
+# In a terminal with no names, let the person choose. The checklist starts with
+# every enabled session ticked, so Enter alone does what a full launch did.
+if (( ${#requested_names} == 0 )) && [[ "$check_only" != true && "$open_all" != true \
+      && -t 0 && -t 1 && -x "$CONFIG_COMMAND" ]]; then
+  exec "$CONFIG_COMMAND" pick --ticked enabled --config "$config_file"
 fi
 
 # Named sessions open even when disabled; a full launch skips disabled ones.

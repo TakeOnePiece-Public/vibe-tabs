@@ -205,16 +205,8 @@ on openProject(rawFolder, requestedName, configuredPanes, requestedLayout, termi
 			set currentStep to "naming the Codex thread for " & sessionName
 			repeat with renamePositionRef in codexRenamePositions
 				set codexPaneID to item (contents of renamePositionRef) of paneIDs
-				-- Typing before the Codex TUI is ready loses the leading keystrokes
-				-- (only the tail of "/rename <name>" arrives and is sent as a prompt).
 				try
-					if my waitForCodexComposer(tmuxBin, codexPaneID) then
-						do shell script quoted form of tmuxBin & " send-keys -t " & quoted form of codexPaneID & " -l " & quoted form of ("/rename " & sessionName)
-						delay 0.3
-						do shell script quoted form of tmuxBin & " send-keys -t " & quoted form of codexPaneID & " C-m"
-					else
-						log "vibe-tab: warning: " & sessionName & ": Codex did not show its prompt within 60 seconds (it may be waiting on an update or login screen); skipped /rename " & sessionName
-					end if
+					my renameCodexThreadLater(tmuxBin, codexPaneID, sessionName)
 				on error renameError
 					log "vibe-tab: warning: " & sessionName & ": could not name the Codex thread: " & renameError
 				end try
@@ -228,9 +220,10 @@ on openProject(rawFolder, requestedName, configuredPanes, requestedLayout, termi
 	on error
 	end try
 
+	-- A tab only counts as this session's when a tmux client attached to the session
+	-- runs in it. A tab can keep the session's custom title after tmux exits there
+	-- (someone ran something else in it), and focusing it would open nothing.
 	set currentStep to "looking for an existing Terminal tab for " & sessionName
-	if my focusNamedTerminalTab(sessionName, terminalProfile) then return
-
 	set attachedTTY to ""
 	try
 		set attachedTTY to do shell script quoted form of tmuxBin & " list-clients -t " & quoted form of sessionName & " -F " & quoted form of "#{client_tty}" & " 2>/dev/null | /usr/bin/head -n 1"
@@ -412,21 +405,32 @@ end codexResumeOptions
 -- composer never appeared within about 60 seconds (for example an "Update now"
 -- prompt that is still waiting for the user). Note: pane_current_command is
 -- not usable here; tmux reports "zsh" for the wrapper shell even while codex runs.
-on waitForCodexComposer(tmuxBin, paneID)
-	repeat 120 times
-		try
-			set paneText to do shell script quoted form of tmuxBin & " capture-pane -p -t " & quoted form of paneID
-			if paneText contains "Ask Codex to do anything" then
-				delay 0.5
-				return true
-			end if
-			if paneText contains "Usage: codex" then return false
-		on error
-		end try
-		delay 0.5
-	end repeat
-	return false
-end waitForCodexComposer
+-- Name a new Codex thread after the session once its composer is ready, without
+-- holding up the launch: Codex may first show an update, login or daemon question
+-- that only the person can answer, and that pane's Terminal tab has to be open for
+-- them to see it. A detached job waits up to 10 minutes. Typing before the composer
+-- is ready loses keystrokes, and an Enter sent while a menu is up picks one of its
+-- options, so it only types once the composer has shown for two checks in a row
+-- with no menu on screen.
+on renameCodexThreadLater(tmuxBin, paneID, sessionName)
+	set waitScript to "t=$1; p=$2; n=$3; ready=0; i=0
+while [ $i -lt 1200 ]; do
+  i=$((i + 1))
+  screen=$(\"$t\" capture-pane -p -t \"$p\" 2>/dev/null) || exit 0
+  case $screen in *'Usage: codex'*) exit 0 ;; esac
+  if printf '%s\\n' \"$screen\" | /usr/bin/grep -q 'Ask Codex to do anything' && ! printf '%s\\n' \"$screen\" | /usr/bin/grep -Eq '^[[:space:]]*(›|>)[[:space:]]*[0-9]+\\.|Update available|Press enter to continue'; then
+    ready=$((ready + 1))
+  else
+    ready=0
+  fi
+  if [ $ready -ge 2 ]; then
+    \"$t\" send-keys -t \"$p\" -l \"/rename $n\" && sleep 0.3 && \"$t\" send-keys -t \"$p\" C-m
+    exit 0
+  fi
+  sleep 0.5
+done"
+	do shell script "/bin/sh -c " & quoted form of waitScript & " vibe-tab-rename " & quoted form of tmuxBin & " " & quoted form of paneID & " " & quoted form of sessionName & " >/dev/null 2>&1 &"
+end renameCodexThreadLater
 
 on parsePaneSpec(paneSpec, homeFolder)
 	if paneSpec starts with "vibe-json:" then
@@ -559,26 +563,6 @@ on waitForTmuxClient(tmuxBin, sessionName)
 	end repeat
 	return false
 end waitForTmuxClient
-
-on focusNamedTerminalTab(sessionName, terminalProfile)
-	tell application "Terminal"
-		repeat with terminalWindow in windows
-			repeat with terminalTab in tabs of terminalWindow
-				try
-					if (custom title of terminalTab as text) is sessionName then
-						my applyTerminalProfile(terminalTab, terminalProfile)
-						set selected tab of terminalWindow to terminalTab
-						set frontmost of terminalWindow to true
-						activate
-						return true
-					end if
-				on error
-				end try
-			end repeat
-		end repeat
-	end tell
-	return false
-end focusNamedTerminalTab
 
 on nameAndFocusTerminalTab(clientTTY, sessionName, terminalProfile)
 	tell application "Terminal"
