@@ -289,7 +289,7 @@ def tname:
 def problem($msg): {level: "error", msg: $msg};
 def notice($msg): {level: "warning", msg: $msg};
 def layouts: ["auto", "even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"];
-def pane_keys: ["agent", "command", "title", "args", "dangerous", "dangerous_args"];
+def pane_keys: ["agent", "command", "title", "args", "dangerous", "dangerous_args", "remote_control"];
 
 def unknown_keys($obj; $allowed; $ctx):
   $obj | keys[] | select(. as $k | $allowed | index($k) | not) |
@@ -325,7 +325,8 @@ def check_pane($p; $ctx):
   elif ($p | type) == "object" then
     unknown_keys($p; pane_keys; $ctx),
     (["agent", "command", "title", "args", "dangerous_args"][] as $k | str_field($p; $k; $ctx; false)),
-    bool_field($p; "dangerous"; $ctx)
+    bool_field($p; "dangerous"; $ctx),
+    bool_field($p; "remote_control"; $ctx)
   else
     problem("\($ctx) must be an agent name, a command, or a mapping; got \($p | tname)")
   end;
@@ -346,9 +347,10 @@ def check_agents($agents):
     if $a == null then empty
     elif ($a | type) != "object" then problem("\($ctx) must be a mapping, got \($a | tname)")
     else
-      unknown_keys($a; ["title", "args", "dangerous", "dangerous_args"]; $ctx),
+      unknown_keys($a; ["title", "args", "dangerous", "dangerous_args", "remote_control"]; $ctx),
       (["title", "args", "dangerous_args"][] as $k | str_field($a; $k; $ctx; false)),
-      bool_field($a; "dangerous"; $ctx)
+      bool_field($a; "dangerous"; $ctx),
+      bool_field($a; "remote_control"; $ctx)
     end
   end;
 
@@ -363,7 +365,8 @@ else
     if $d == null then empty
     elif ($d | type) != "object" then problem("defaults must be a mapping, got \($d | tname)")
     else
-      unknown_keys($d; ["session_suffix", "layout", "terminal_profile", "agents", "panes", "codex_args"]; "defaults"),
+      unknown_keys($d; ["session_suffix", "layout", "terminal_profile", "agents", "panes", "codex_args", "trust_check"]; "defaults"),
+      bool_field($d; "trust_check"; "defaults"),
       (["session_suffix", "terminal_profile", "codex_args"][] as $k | str_field($d; $k; "defaults"; false)),
       layout_field($d; "defaults"),
       check_panes($d; "defaults"),
@@ -429,8 +432,13 @@ read -r -d '' NORMALIZE_JQ <<'JQ'
       title: ($merged.title // ""),
       args: ($merged.args // (if $merged.agent == "codex" then $legacyCodexArgs else "" end)),
       dangerous: ($merged.dangerous // false),
-      dangerous_args: ($merged.dangerous_args // "")
-    }
+      dangerous_args: ($merged.dangerous_args // ""),
+      remote_control: ($merged.remote_control // false)
+    } |
+    # Claude's --remote-control goes last: it takes an optional name argument.
+    if .remote_control and .agent == "claude" then
+      .args = ([.args, "--remote-control"] | map(select(length > 0)) | join(" "))
+    else . end
   ]
 }
 JQ
@@ -443,6 +451,8 @@ if (.agent | length) > 0 and (.command | length) > 0 then
   "\($pctx) sets both agent (\(.agent | tojson)) and command (\(.command | tojson)); a pane runs one or the other"
 elif (.agent | length) == 0 and (.command | length) == 0 then
   "\($pctx) needs an agent or a command"
+elif .remote_control and .agent != "claude" then
+  "\($pctx) sets remote_control: true, which only Claude supports"
 elif .dangerous and (.dangerous_args | length) == 0 and (.agent as $agent | ["claude", "codex", "gemini"] | index($agent) | not) then
   if (.agent | length) > 0 then
     "\($pctx) sets dangerous: true for agent \(.agent | tojson), which has no built-in dangerous flag; set dangerous_args"
@@ -618,6 +628,98 @@ if [[ "$check_only" == true ]]; then
     exit 1
   fi
   exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Folder trust: Claude and Codex each ask "do you trust this folder?" the first
+# time they open in one, which stops every new tab until it is answered. Ask
+# once here instead, for all the folders about to open, and record the answer
+# the way the agents do. Nothing is trusted without a yes, and only folders in
+# this config are ever touched. Set defaults.trust_check: false to skip this.
+# ---------------------------------------------------------------------------
+
+claude_state="${VIBE_TABS_CLAUDE_JSON:-$HOME/.claude.json}"
+codex_config="${VIBE_TABS_CODEX_CONFIG:-$HOME/.codex/config.toml}"
+
+# claude_trusts DIR: Claude trusts DIR or one of its parents.
+claude_trusts() {
+  "$jq_bin" -e --arg dir "$1" '
+    (.projects // {}) as $p |
+    [$dir | recurse(if . == "/" then empty else (sub("/[^/]*$"; "") | if . == "" then "/" else . end) end)] |
+    any(.[]; $p[.].hasTrustDialogAccepted == true)' "$claude_state" >/dev/null 2>&1
+}
+
+# codex_has_project DIR: config.toml already has a [projects."DIR"] table (trusted or not).
+codex_has_project() {
+  /usr/bin/grep -qF -- "[projects.\"$1\"]" "$codex_config" 2>/dev/null
+}
+
+trust_claude() {
+  local mode tmp
+  mode="$(/usr/bin/stat -f %Lp "$claude_state" 2>/dev/null)" || mode=600
+  tmp="$(/usr/bin/mktemp "${claude_state:h}/.claude.json.vibe-tabs.XXXXXX")" || return 1
+  if ! "$jq_bin" '
+      reduce $ARGS.positional[] as $dir (.;
+        .projects[$dir] = ((.projects[$dir] // {}) + {hasTrustDialogAccepted: true}))' \
+      --args "$@" <"$claude_state" >"$tmp" 2>/dev/null; then
+    /bin/rm -f "$tmp"
+    return 1
+  fi
+  /bin/chmod "$mode" "$tmp" && /bin/mv -f "$tmp" "$claude_state"
+}
+
+trust_codex() {
+  local dir
+  for dir in "$@"; do
+    print -r -- $'\n'"[projects.\"$dir\"]"$'\ntrust_level = "trusted"' >>"$codex_config" || return 1
+  done
+}
+
+trust_check="$("$jq_bin" -r 'if .defaults.trust_check == false then "false" else "true" end' "$work_dir/config.json")"
+typeset -a untrusted_claude untrusted_codex untrusted_shown
+if [[ "$trust_check" == true ]]; then
+  for (( i = 1; i <= total; i++ )); do
+    [[ -z "${s_skip[i]}" ]] || continue
+    dir="${s_path[i]:A}"
+    asked=false
+    if [[ -f "$claude_state" ]] && "$jq_bin" -e '[.panes[].agent] | index("claude")' <<<"${s_json[i]}" >/dev/null \
+        && ! claude_trusts "$dir"; then
+      untrusted_claude+=("$dir"); asked=true
+    fi
+    if [[ -f "$codex_config" ]] && "$jq_bin" -e '[.panes[].agent] | index("codex")' <<<"${s_json[i]}" >/dev/null \
+        && ! codex_has_project "$dir"; then
+      untrusted_codex+=("$dir"); asked=true
+    fi
+    [[ "$asked" == true ]] && untrusted_shown+=("${s_name[i]}  $(pretty_path "$dir")")
+  done
+fi
+
+if (( ${#untrusted_shown} > 0 )); then
+  if [[ -t 0 || -n "${VIBE_TABS_TRUST_ANSWER-}" ]]; then
+    print -r -- "These folders aren't trusted yet, so each of their tabs would stop to ask:"
+    for line in "${untrusted_shown[@]}"; do print -r -- "  $line"; done
+    if [[ -n "${VIBE_TABS_TRUST_ANSWER-}" ]]; then
+      # Tests answer here instead of at a terminal.
+      trust_answer="$VIBE_TABS_TRUST_ANSWER"
+    else
+      read -q "trust_answer?Trust them all now? Claude and Codex can then read, edit and run files there. [y/N] "
+      print ""
+    fi
+    if [[ "$trust_answer" == [yY] ]]; then
+      if (( ${#untrusted_claude} > 0 )); then
+        trust_claude "${untrusted_claude[@]}" || warn "could not update $(pretty_path "$claude_state"); Claude will ask in each tab"
+      fi
+      if (( ${#untrusted_codex} > 0 )); then
+        trust_codex "${untrusted_codex[@]}" || warn "could not update $(pretty_path "$codex_config"); Codex will ask in each tab"
+      fi
+      print -r -- "Trusted ${#untrusted_shown} folder(s)."
+    else
+      print -r -- "Not trusted; each tab will ask."
+    fi
+  else
+    warn "${#untrusted_shown} folder(s) aren't trusted yet, so their tabs will ask first: ${(j:, :)untrusted_shown}"
+    hint "Run vibe-tabs from a terminal to trust them all with one answer"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -136,8 +136,9 @@ Defaults and per-session options:
 - `session_suffix`: appended to names unless already present; useful for names such as `web-m1-mbp`.
 - `layout`: `auto`, `even-horizontal`, `even-vertical`, `main-horizontal`, `main-vertical`, or `tiled`. `auto` uses side-by-side panes for two commands and tiled panes for three or more.
 - `terminal_profile`: optional Terminal settings profile such as `Pro`, `Ocean`, or `Homebrew`. A session can override the default.
-- `agents`: optional defaults keyed by agent name. Each agent can set `dangerous`, `args`, and `dangerous_args`.
+- `agents`: optional defaults keyed by agent name. Each agent can set `dangerous`, `args`, `dangerous_args`, and (Claude only) `remote_control`.
 - `panes`: non-empty list of agent or command entries. Plain strings remain supported as shorthand. `claude` and `codex` activate built-in resume handling.
+- `trust_check` (defaults only): `true` by default; see [Folder trust](#folder-trust). Set `false` to skip it.
 
 Pane objects support:
 
@@ -147,6 +148,7 @@ Pane objects support:
 - `dangerous_args`: override for the flag added by `dangerous: true`. Built-in defaults are `--dangerously-skip-permissions` for Claude and `--yolo` for Codex and Gemini. Unknown agents and custom commands require this field when dangerous mode is enabled.
 - `args`: additional shell-style arguments passed whether dangerous mode is on or off.
 - `title`: optional short tmux pane title.
+- `remote_control`: Claude only; `true` starts Claude with `--remote-control`, so the session can be continued from the Claude app on your phone or at claude.ai/code. Set it under `defaults.agents.claude` to turn it on everywhere.
 
 Dangerous mode bypasses approval or sandbox safeguards in the selected coding CLI. Enable it only for agents and projects where that is intentional. Never put credentials in `args`, `dangerous_args`, or commands.
 
@@ -160,6 +162,19 @@ Optionally:
 - `enabled`: `false` keeps the session in the config but skips it when everything opens. Naming it (`vibe-tabs web`) still opens it.
 
 Per-session options override `defaults`. Existing tmux sessions remain untouched, so pane or layout changes take effect after that tmux session is removed.
+
+### Folder trust
+
+Claude and Codex each ask whether you trust a folder the first time they open in it, and every new tab waits on that question. Before opening anything, Vibe Tabs lists the folders that aren't trusted yet and asks once:
+
+```text
+These folders aren't trusted yet, so each of their tabs would stop to ask:
+  gists  ~/Repos/gists
+  gas  ~/Repos/gas
+Trust them all now? Claude and Codex can then read, edit and run files there. [y/N]
+```
+
+Yes records the answer where each agent keeps it (`hasTrustDialogAccepted` in `~/.claude.json`, `trust_level = "trusted"` in `~/.codex/config.toml`), exactly as answering in the tab would. Anything else trusts nothing, and the tabs ask as usual. Only folders in the config are ever touched; a folder already trusted (for Claude, also through a parent folder) is not listed, and a Codex folder you marked `untrusted` is left alone. Launched from the app or anywhere without a terminal, Vibe Tabs cannot ask, so it only names the untrusted folders.
 
 ## Commands
 

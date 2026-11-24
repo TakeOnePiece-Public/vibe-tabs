@@ -15,6 +15,9 @@ WORK="$(mktemp -d "${tmp_root%/}/vibe-tabs-test.XXXXXX")"
 WORK="${WORK:A}"  # /var is a symlink to /private/var on macOS
 trap '/bin/rm -rf "$WORK"' EXIT
 export VIBE_TABS_TEST_OUTPUT="$WORK/captured.txt"
+# Never read or write the real Claude and Codex settings.
+export VIBE_TABS_CLAUDE_JSON="$WORK/no-claude.json" VIBE_TABS_CODEX_CONFIG="$WORK/no-codex.toml"
+unset VIBE_TABS_TRUST_ANSWER
 
 passed=0
 failed=0
@@ -439,6 +442,75 @@ run "$VIBE_TABS" pick --ticked some </dev/null
 expect "pick --ticked takes none, enabled or all" 1 "--ticked takes none, enabled or all"
 
 unset VIBE_TABS_CONFIG
+
+# ---------------------------------------------------------------------------
+# remote_control and the one-time folder trust question
+# ---------------------------------------------------------------------------
+
+mkdir -p "$WORK/proj-a" "$WORK/proj-b" "$WORK/trusted-parent/child"
+write_config trust.yml "version: 1
+defaults:
+  agents:
+    claude:
+      remote_control: true
+  panes:
+    - agent: claude
+    - agent: codex
+sessions:
+  - name: a
+    path: $WORK/proj-a
+  - name: b
+    path: $WORK/proj-b
+  - name: c
+    path: $WORK/trusted-parent/child"
+
+pane_json() { sed -n "${1}p" "$VIBE_TABS_TEST_OUTPUT" | tr '|' '\n' | grep '^vibe-json:' | sed -n "${2}p" | sed 's/^vibe-json://' | base64 -D; }
+
+run "$VIBE_TABS" "$WORK/trust.yml" a
+check "remote_control adds --remote-control to Claude" 'pane_json 1 1 | jq -e ".agent == \"claude\" and .args == \"--remote-control\"" >/dev/null'
+check "remote_control leaves Codex alone" 'pane_json 1 2 | jq -e ".agent == \"codex\" and .args == \"\"" >/dev/null'
+
+write_config bad-rc.yml "version: 1
+sessions:
+  - name: a
+    path: /tmp
+    panes:
+      - agent: codex
+        remote_control: true"
+run "$VIBE_TABS" "$WORK/bad-rc.yml"
+expect "remote_control on Codex is refused" 2 "remote_control: true, which only Claude supports"
+
+export VIBE_TABS_CLAUDE_JSON="$WORK/claude.json" VIBE_TABS_CODEX_CONFIG="$WORK/codex.toml"
+print -r -- '{"numStartups": 3, "projects": {"'"$WORK"'/trusted-parent": {"hasTrustDialogAccepted": true, "allowedTools": ["x"]}}}' >"$VIBE_TABS_CLAUDE_JSON"
+chmod 600 "$VIBE_TABS_CLAUDE_JSON"
+print -r -- $'model = "gpt"\n\n[projects."'"$WORK"$'/proj-b"]\ntrust_level = "untrusted"' >"$VIBE_TABS_CODEX_CONFIG"
+cp "$VIBE_TABS_CLAUDE_JSON" "$WORK/claude.orig"; cp "$VIBE_TABS_CODEX_CONFIG" "$WORK/codex.orig"
+
+run "$VIBE_TABS" "$WORK/trust.yml" </dev/null
+expect "without a terminal, untrusted folders are only reported" 0 "3 folder(s) aren't trusted yet" "opened 3 session(s)"
+check "reporting writes nothing" 'cmp -s "$VIBE_TABS_CLAUDE_JSON" "$WORK/claude.orig" && cmp -s "$VIBE_TABS_CODEX_CONFIG" "$WORK/codex.orig"'
+
+VIBE_TABS_TRUST_ANSWER=n run "$VIBE_TABS" "$WORK/trust.yml"
+expect "answering no trusts nothing" 0 "Not trusted; each tab will ask." "opened 3 session(s)"
+check "no writes nothing" 'cmp -s "$VIBE_TABS_CLAUDE_JSON" "$WORK/claude.orig" && cmp -s "$VIBE_TABS_CODEX_CONFIG" "$WORK/codex.orig"'
+
+VIBE_TABS_TRUST_ANSWER=y run "$VIBE_TABS" "$WORK/trust.yml"
+expect "answering yes trusts the listed folders" 0 "Trusted 3 folder(s)." "opened 3 session(s)"
+check "Claude trusts proj-a and proj-b" 'jq -e --arg w "$WORK" ".projects[\$w + \"/proj-a\"].hasTrustDialogAccepted and .projects[\$w + \"/proj-b\"].hasTrustDialogAccepted" "$VIBE_TABS_CLAUDE_JSON" >/dev/null'
+check "a trusted parent counts for Claude, so c gets no entry" 'jq -e --arg w "$WORK" ".projects | has(\$w + \"/trusted-parent/child\") | not" "$VIBE_TABS_CLAUDE_JSON" >/dev/null'
+check "the rest of the Claude settings survive" 'jq -e --arg w "$WORK" ".numStartups == 3 and .projects[\$w + \"/trusted-parent\"].allowedTools == [\"x\"]" "$VIBE_TABS_CLAUDE_JSON" >/dev/null'
+check "Claude settings stay private (600)" '[[ "$(stat -f %Lp "$VIBE_TABS_CLAUDE_JSON")" == 600 ]]'
+check "Codex trusts proj-a and every other folder" 'grep -qF "[projects.\"$WORK/proj-a\"]" "$VIBE_TABS_CODEX_CONFIG" && grep -qF "[projects.\"$WORK/trusted-parent/child\"]" "$VIBE_TABS_CODEX_CONFIG"'
+check "a folder marked untrusted in Codex is left alone" '[[ "$(grep -cF "[projects.\"$WORK/proj-b\"]" "$VIBE_TABS_CODEX_CONFIG")" == 1 ]] && grep -q "untrusted" "$VIBE_TABS_CODEX_CONFIG"'
+
+VIBE_TABS_TRUST_ANSWER=y run "$VIBE_TABS" "$WORK/trust.yml"
+check "once trusted, nothing is asked again" '[[ "$OUT" != *"aren'"'"'t trusted"* && "$STATUS" == 0 ]]'
+
+cp "$WORK/claude.orig" "$VIBE_TABS_CLAUDE_JSON"
+write_config trust-off.yml "$(cat "$WORK/trust.yml" | sed 's/^defaults:/defaults:\n  trust_check: false/')"
+run "$VIBE_TABS" "$WORK/trust-off.yml" </dev/null
+check "trust_check: false skips the question" '[[ "$OUT" != *"trusted yet"* && "$STATUS" == 0 ]]'
+export VIBE_TABS_CLAUDE_JSON="$WORK/no-claude.json" VIBE_TABS_CODEX_CONFIG="$WORK/no-codex.toml"
 
 print ""
 if (( failed > 0 )); then
